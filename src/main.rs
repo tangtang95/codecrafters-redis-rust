@@ -1,11 +1,9 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream}, thread,
 };
 
 fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
     println!("Redis listening on port 6379");
 
@@ -13,7 +11,9 @@ fn main() {
         match stream {
             Ok(mut _stream) => {
                 println!("accepted new connection");
-                let _ = handle_client(_stream);
+                thread::spawn(move || {
+                    let _ = handle_client(_stream);
+                });
             }
             Err(e) => {
                 println!("error: {}", e);
@@ -30,6 +30,8 @@ fn handle_client(mut stream: TcpStream) -> anyhow::Result<()> {
         if bytes_read == 0 {
             return Ok(());
         }
+
+        println!("received: {}", std::str::from_utf8(&buf)?);
         stream.write_all(b"+PONG\r\n")?;
     }
 }
