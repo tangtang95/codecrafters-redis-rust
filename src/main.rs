@@ -171,9 +171,10 @@ fn handle_command(command: RedisCommands, args: &[Resp], stream: &mut TcpStream,
                     let expire = match args.get(2..4) {
                         Some([option, value]) => {
                             let Resp::BulkString(option) = option else { return Err(anyhow!("set command invalid option")) };
-                            let Resp::Integer(value) = value else { return Err(anyhow!("set command invalid option-value")) };
+                            let Resp::BulkString(value) = value else { return Err(anyhow!("set command invalid option-value")) };
                             if option.eq_ignore_ascii_case("px") {
-                                Some(*value as u64)
+                                let value = value.parse::<u64>()?;
+                                Some(value)
                             } else {
                                 None
                             }
