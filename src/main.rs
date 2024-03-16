@@ -181,8 +181,8 @@ fn handle_command(command: RedisCommands, args: &[Resp], stream: &mut TcpStream,
                         },
                         _ => None,
                     };
-                    let mut map = redis_map.lock().unwrap();
-                    map.insert(key.to_owned(), Value { value: value.to_owned(), expire, timestamp: SystemTime::now() });
+                    redis_map.lock().unwrap()
+                        .insert(key.to_owned(), Value { value: value.to_owned(), expire, timestamp: SystemTime::now() });
                     let ok = Resp::SimpleString("OK");
                     stream.write_all(ok.encode_to_string().as_bytes())?;
                     Ok(())
