@@ -1,15 +1,21 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex},
+    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex}, time::{SystemTime, Duration},
 };
 
 use anyhow::anyhow;
+
+struct Value {
+    value: String,
+    expire: Option<u64>,
+    timestamp: SystemTime
+}
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
     println!("Redis listening on port 6379");
 
-    let redis_map = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+    let redis_map = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
 
     for stream in listener.incoming() {
         match stream {
@@ -27,7 +33,7 @@ fn main() {
     }
 }
 
-fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, String>>>) -> anyhow::Result<()> {
+fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
     loop {
         let mut bytes = [0u8; 512];
         let bytes_read = stream.read(&mut bytes)?;
@@ -61,6 +67,7 @@ enum Resp<'a> {
     Array(Vec<Resp<'a>>),
     BulkString(String),
     SimpleString(&'a str),
+    Integer(i64),
     NullBulkString
 }
 
@@ -71,6 +78,7 @@ impl<'a> Resp<'a> {
             Resp::BulkString(string) => format!("${}\r\n{}\r\n", string.len(), string),
             Resp::SimpleString(string) => format!("+{}\r\n", string),
             Resp::NullBulkString => "$-1\r\n".to_string(),
+            Resp::Integer(num) => format!(":{}\r\n", num),
         }
     }
 }
@@ -125,6 +133,12 @@ fn parse_resp(resp: &str) -> anyhow::Result<(&str, Resp)> {
             let remainder = resp.get(consumed_len..).ok_or(anyhow!("RESP out of bounds"))?;
             Ok((remainder, Resp::BulkString(line.to_owned())))
         },
+        ":" => {
+            let line = resp.lines().next().ok_or(anyhow!("RESP next line not found"))?;
+            let integer = line.trim_start_matches(':').parse::<i64>()?;
+            let remainder = resp.get(line.len()+2..).ok_or(anyhow!("RESP out of bounds"))?;
+            Ok((remainder, Resp::Integer(integer)))
+        },
         _ => {
             println!("RESP type `{:?}` not implemented", resp_type);
             unimplemented!()
@@ -132,7 +146,7 @@ fn parse_resp(resp: &str) -> anyhow::Result<(&str, Resp)> {
     }
 }
 
-fn handle_command(command: RedisCommands, args: &[Resp], stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, String>>>) -> anyhow::Result<()> {
+fn handle_command(command: RedisCommands, args: &[Resp], stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
     match command {
         RedisCommands::Echo => {
             match args.first() {
@@ -153,9 +167,21 @@ fn handle_command(command: RedisCommands, args: &[Resp], stream: &mut TcpStream,
             match args.get(0..2) {
                 Some([key, value]) => {
                     let Resp::BulkString(key) = key else { return Err(anyhow!("set command invalid key")) };
-                    let Resp::BulkString(value) = value else { return Err(anyhow!("set command invalid key")) };
+                    let Resp::BulkString(value) = value else { return Err(anyhow!("set command invalid value")) };
+                    let expire = match args.get(2..4) {
+                        Some([option, value]) => {
+                            let Resp::BulkString(option) = option else { return Err(anyhow!("set command invalid option")) };
+                            let Resp::Integer(value) = value else { return Err(anyhow!("set command invalid option-value")) };
+                            if option.eq_ignore_ascii_case("px") {
+                                Some(*value as u64)
+                            } else {
+                                None
+                            }
+                        },
+                        _ => None,
+                    };
                     let mut map = redis_map.lock().unwrap();
-                    map.insert(key.to_owned(), value.to_owned());
+                    map.insert(key.to_owned(), Value { value: value.to_owned(), expire, timestamp: SystemTime::now() });
                     let ok = Resp::SimpleString("OK");
                     stream.write_all(ok.encode_to_string().as_bytes())?;
                     Ok(())
@@ -166,7 +192,17 @@ fn handle_command(command: RedisCommands, args: &[Resp], stream: &mut TcpStream,
         RedisCommands::Get => {
             match args.first() {
                 Some(Resp::BulkString(key)) => {
-                    let value = redis_map.lock().unwrap().get(key).map(|k| k.to_owned());
+                    let value = redis_map.lock().unwrap()
+                        .get(key)
+                        .filter(|k| {
+                            if let Some(expire) = k.expire {
+                                if let Ok(duration) = SystemTime::now().duration_since(k.timestamp) {
+                                    return duration < Duration::from_millis(expire);
+                                }
+                            }
+                            true
+                        })
+                        .map(|k| k.value.to_string());
                     if let Some(value) = value {
                         let value = Resp::BulkString(value);
                         stream.write_all(value.encode_to_string().as_bytes())?;
