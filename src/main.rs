@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream}, thread,
+    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex},
 };
 
 use anyhow::anyhow;
@@ -9,12 +9,15 @@ fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
     println!("Redis listening on port 6379");
 
+    let redis_map = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+
     for stream in listener.incoming() {
         match stream {
             Ok(mut _stream) => {
                 println!("accepted new connection");
+                let redis_map = redis_map.clone();
                 thread::spawn(move || {
-                    let _ = handle_client(_stream);
+                    let _ = handle_client(_stream, redis_map);
                 });
             }
             Err(e) => {
@@ -24,7 +27,7 @@ fn main() {
     }
 }
 
-fn handle_client(mut stream: TcpStream) -> anyhow::Result<()> {
+fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, String>>>) -> anyhow::Result<()> {
     loop {
         let mut bytes = [0u8; 512];
         let bytes_read = stream.read(&mut bytes)?;
@@ -40,7 +43,7 @@ fn handle_client(mut stream: TcpStream) -> anyhow::Result<()> {
                 match array.first() {
                     Some(Resp::BulkString(text)) => {
                         let args = array.get(1..).ok_or(anyhow!("Should not go out of bounds"))?;
-                        handle_command(text.as_str().into(), args, &mut stream)?;
+                        handle_command(text.as_str().into(), args, &mut stream, redis_map.clone())?;
                     },
                     Some(_) => unimplemented!(),
                     None => unimplemented!()
@@ -53,14 +56,30 @@ fn handle_client(mut stream: TcpStream) -> anyhow::Result<()> {
     }
 }
 
-enum Resp {
-    Array(Vec<Resp>),
+#[derive(PartialEq)]
+enum Resp<'a> {
+    Array(Vec<Resp<'a>>),
     BulkString(String),
+    SimpleString(&'a str),
+    NullBulkString
+}
+
+impl<'a> Resp<'a> {
+    pub fn encode_to_string(&self) -> String {
+        match self {
+            Resp::Array(_) => todo!(),
+            Resp::BulkString(string) => format!("${}\r\n{}\r\n", string.len(), string),
+            Resp::SimpleString(string) => format!("+{}\r\n", string),
+            Resp::NullBulkString => "$-1\r\n".to_string(),
+        }
+    }
 }
 
 enum RedisCommands {
     Echo,
-    Ping
+    Ping,
+    Set,
+    Get
 }
 
 impl From<&str> for RedisCommands {
@@ -68,6 +87,8 @@ impl From<&str> for RedisCommands {
         match value.to_lowercase().as_ref() {
             "echo" => RedisCommands::Echo,
             "ping" => RedisCommands::Ping,
+            "set" => RedisCommands::Set,
+            "get" => RedisCommands::Get,
             _ => unimplemented!()
         }
     }
@@ -105,27 +126,58 @@ fn parse_resp(resp: &str) -> anyhow::Result<(&str, Resp)> {
             Ok((remainder, Resp::BulkString(line.to_owned())))
         },
         _ => {
-            println!("{:?}", resp_type);
+            println!("RESP type `{:?}` not implemented", resp_type);
             unimplemented!()
         }
     }
 }
 
-fn handle_command(command: RedisCommands, args: &[Resp], stream: &mut TcpStream) -> anyhow::Result<()> {
+fn handle_command(command: RedisCommands, args: &[Resp], stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, String>>>) -> anyhow::Result<()> {
     match command {
         RedisCommands::Echo => {
             match args.first() {
                 Some(Resp::BulkString(text)) => {
-                    let response = format!("+{}\r\n", text);
-                    stream.write_all(response.as_bytes())?;
+                    let response = Resp::SimpleString(text);
+                    stream.write_all(response.encode_to_string().as_bytes())?;
                     Ok(())
                 },
                 _ => Err(anyhow!("echo arg not found"))
             }
         },
         RedisCommands::Ping => {
-            stream.write_all(b"+PONG\r\n")?;
+            let pong = Resp::SimpleString("PONG");
+            stream.write_all(pong.encode_to_string().as_bytes())?;
             Ok(())
-        }
+        },
+        RedisCommands::Set => {
+            match args.get(0..2) {
+                Some([key, value]) => {
+                    let Resp::BulkString(key) = key else { return Err(anyhow!("set command invalid key")) };
+                    let Resp::BulkString(value) = value else { return Err(anyhow!("set command invalid key")) };
+                    let mut map = redis_map.lock().unwrap();
+                    map.insert(key.to_owned(), value.to_owned());
+                    let ok = Resp::SimpleString("OK");
+                    stream.write_all(ok.encode_to_string().as_bytes())?;
+                    Ok(())
+                },
+                _ => Err(anyhow!("set command needs at least 2 arguments")),
+            }
+        },
+        RedisCommands::Get => {
+            match args.first() {
+                Some(Resp::BulkString(key)) => {
+                    let value = redis_map.lock().unwrap().get(key).map(|k| k.to_owned());
+                    if let Some(value) = value {
+                        let value = Resp::BulkString(value);
+                        stream.write_all(value.encode_to_string().as_bytes())?;
+                    } else {
+                        let null = Resp::NullBulkString;
+                        stream.write_all(null.encode_to_string().as_bytes())?;
+                    }
+                    Ok(())
+                },
+                _ => Err(anyhow!("echo arg not found"))
+            }
+        },
     }
 }
