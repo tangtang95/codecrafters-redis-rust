@@ -1,9 +1,9 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex}, time::{SystemTime, Duration},
+    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex}, time::{SystemTime, Duration}, env::{self},
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 
 struct Value {
     value: String,
@@ -11,9 +11,17 @@ struct Value {
     timestamp: SystemTime
 }
 
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
-    println!("Redis listening on port 6379");
+fn main() -> anyhow::Result<()>{
+    let mut args = env::args();
+    let mut port = 6379u16;
+    while let Some(arg) = args.next() {
+        if arg.eq("--port") {
+            let port_text = args.next().ok_or(anyhow!("port arg not found"))?;
+            port = port_text.parse::<u16>().with_context(|| "port is not a number between 0 and 65536")?;
+        }
+    }
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
+    println!("Redis listening on port {port}");
 
     let redis_map = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
 
@@ -31,6 +39,7 @@ fn main() {
             }
         }
     }
+    Ok(())
 }
 
 fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
