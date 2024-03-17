@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex}, time::{SystemTime, Duration}, env::{self},
+    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex}, time::{SystemTime, Duration}, env,
 };
 
 use anyhow::{anyhow, Context};
@@ -25,14 +25,21 @@ fn main() -> anyhow::Result<()>{
 
     let redis_map = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
 
+    let mut socket_id: u64 = 0;
     for stream in listener.incoming() {
         match stream {
             Ok(mut _stream) => {
-                println!("accepted new connection");
+                let _socket_id = socket_id;
                 let redis_map = redis_map.clone();
+
+                println!("accepted new connection socket {}", _socket_id);
                 thread::spawn(move || {
-                    let _ = handle_client(_stream, redis_map);
+                    match handle_client(_stream, redis_map) {
+                        Ok(_) => println!("connection {} handled correctly", _socket_id),
+                        Err(err) => println!("{}", err),
+                    }
                 });
+                socket_id += 1;
             }
             Err(e) => {
                 println!("error: {}", e);
@@ -50,24 +57,11 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
             return Ok(());
         }
 
-        let buf = String::from_utf8(bytes.to_vec())?;
-        println!("received: {:?}", buf.trim_end_matches('\0'));
-        let (_, commands) = parse_resp(buf.trim_end_matches('\0'))?;
-        match &commands {
-            Resp::Array(array) => {
-                match array.first() {
-                    Some(Resp::BulkString(text)) => {
-                        let args = array.get(1..).ok_or(anyhow!("Should not go out of bounds"))?;
-                        handle_command(text.as_str().into(), args, &mut stream, redis_map.clone())?;
-                    },
-                    Some(_) => unimplemented!(),
-                    None => unimplemented!()
-                }
-            }
-            _ => {
-                unimplemented!()
-            }
-        }
+        let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
+        println!("received: {}", buf);
+        let (_, tokens) = tokenize(&buf)?;
+        let command: RedisCommands = tokens.try_into()?;
+        handle_command(command, &mut stream, redis_map.clone())?;
     }
 }
 
@@ -93,25 +87,90 @@ impl<'a> Resp<'a> {
 }
 
 enum RedisCommands {
-    Echo,
+    Echo(String),
     Ping,
-    Set,
-    Get
+    Set(SetOptions),
+    Get(String),
+    Info(Option<InfoSection>),
 }
 
-impl From<&str> for RedisCommands {
-    fn from(value: &str) -> Self {
+struct SetOptions {
+    key: String,
+    value: String,
+    expire: Option<u64>
+}
+
+enum InfoSection {
+    Replication
+}
+
+impl TryFrom<&str> for InfoSection {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value.to_lowercase().as_ref() {
-            "echo" => RedisCommands::Echo,
-            "ping" => RedisCommands::Ping,
-            "set" => RedisCommands::Set,
-            "get" => RedisCommands::Get,
+            "replication" => Ok(InfoSection::Replication),
+            section => Err(anyhow!("info section {section} not supported"))
+        }
+    }
+}
+
+impl<'a> TryFrom<Resp<'a>> for RedisCommands {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Resp<'a>) -> Result<Self, Self::Error> {
+        let Resp::Array(array) = value else { return Err(anyhow!("Command failed"))};
+        let Some(Resp::BulkString(command)) = array.first() else { return Err(anyhow!("Command failed"))};
+        match command.to_lowercase().as_ref() {
+            "ping" => Ok(RedisCommands::Ping),
+            "echo" => {
+                match array.get(1) {
+                    Some(Resp::BulkString(text)) => Ok(RedisCommands::Echo(text.to_string())),
+                    _ => Err(anyhow!("Echo arg not supported"))
+                }
+            },
+            "set" => { 
+                match array.get(1..3) {
+                    Some([Resp::BulkString(key), Resp::BulkString(value)]) => {
+                        let expire = match array.get(3..5) {
+                            Some([Resp::BulkString(option), Resp::BulkString(value)]) => {
+                                if option.eq_ignore_ascii_case("px") {
+                                    let value = value.parse::<u64>()?;
+                                    Some(value)
+                                } else {
+                                    None
+                                }
+                            },
+                            _ => None
+                        };
+                        Ok(RedisCommands::Set(SetOptions {
+                            key: key.to_string(),
+                            value: value.to_string(),
+                            expire
+                        }))
+                    },
+                    _ => Err(anyhow!("Set arg not supported"))
+                }
+            },
+            "get" => { 
+                match array.get(1) {
+                    Some(Resp::BulkString(text)) => Ok(RedisCommands::Get(text.to_string())),
+                    _ => Err(anyhow!("Get arg not supported"))
+                }
+            },
+            "info" => {
+                match array.get(1) {
+                    Some(Resp::BulkString(section)) => Ok(RedisCommands::Info(Some(section.as_str().try_into()?))),
+                    None => Ok(RedisCommands::Info(None)),
+                    _ => Err(anyhow!("Info arg not supported"))
+                }
+            },
             _ => unimplemented!()
         }
     }
 }
 
-fn parse_resp(resp: &str) -> anyhow::Result<(&str, Resp)> {
+fn tokenize(resp: &str) -> anyhow::Result<(&str, Resp)> {
     let resp_type = resp.get(0..1).ok_or(anyhow!("RESP type not found"))?;
     match resp_type {
        "*" => {
@@ -120,7 +179,7 @@ fn parse_resp(resp: &str) -> anyhow::Result<(&str, Resp)> {
             let mut vec: Vec<Resp> = Vec::new();
             let mut remainder = resp.get(line.len()+2..).ok_or(anyhow!("RESP out of bounds"))?;
             for _ in 0..len {
-                let (new_remainder, child_resp) = parse_resp(remainder)?;
+                let (new_remainder, child_resp) = tokenize(remainder)?;
                 vec.push(child_resp);
                 remainder = new_remainder;
             }
@@ -155,75 +214,58 @@ fn parse_resp(resp: &str) -> anyhow::Result<(&str, Resp)> {
     }
 }
 
-fn handle_command(command: RedisCommands, args: &[Resp], stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
+fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
     match command {
-        RedisCommands::Echo => {
-            match args.first() {
-                Some(Resp::BulkString(text)) => {
-                    let response = Resp::SimpleString(text);
-                    stream.write_all(response.encode_to_string().as_bytes())?;
-                    Ok(())
-                },
-                _ => Err(anyhow!("echo arg not found"))
-            }
+        RedisCommands::Echo(text) => {
+            let response = Resp::SimpleString(&text);
+            stream.write_all(response.encode_to_string().as_bytes())?;
+            Ok(())
         },
         RedisCommands::Ping => {
             let pong = Resp::SimpleString("PONG");
             stream.write_all(pong.encode_to_string().as_bytes())?;
             Ok(())
         },
-        RedisCommands::Set => {
-            match args.get(0..2) {
-                Some([key, value]) => {
-                    let Resp::BulkString(key) = key else { return Err(anyhow!("set command invalid key")) };
-                    let Resp::BulkString(value) = value else { return Err(anyhow!("set command invalid value")) };
-                    let expire = match args.get(2..4) {
-                        Some([option, value]) => {
-                            let Resp::BulkString(option) = option else { return Err(anyhow!("set command invalid option")) };
-                            let Resp::BulkString(value) = value else { return Err(anyhow!("set command invalid option-value")) };
-                            if option.eq_ignore_ascii_case("px") {
-                                let value = value.parse::<u64>()?;
-                                Some(value)
-                            } else {
-                                None
-                            }
-                        },
-                        _ => None,
-                    };
-                    redis_map.lock().unwrap()
-                        .insert(key.to_owned(), Value { value: value.to_owned(), expire, timestamp: SystemTime::now() });
-                    let ok = Resp::SimpleString("OK");
-                    stream.write_all(ok.encode_to_string().as_bytes())?;
-                    Ok(())
-                },
-                _ => Err(anyhow!("set command needs at least 2 arguments")),
-            }
+        RedisCommands::Set(options) => {
+            redis_map.lock().unwrap()
+                .insert(options.key, Value { value: options.value, expire: options.expire, timestamp: SystemTime::now() });
+            let ok = Resp::SimpleString("OK");
+            stream.write_all(ok.encode_to_string().as_bytes())?;
+            Ok(())
         },
-        RedisCommands::Get => {
-            match args.first() {
-                Some(Resp::BulkString(key)) => {
-                    let value = redis_map.lock().unwrap()
-                        .get(key)
-                        .filter(|k| {
-                            if let Some(expire) = k.expire {
-                                if let Ok(duration) = SystemTime::now().duration_since(k.timestamp) {
-                                    return duration < Duration::from_millis(expire);
-                                }
-                            }
-                            true
-                        })
-                        .map(|k| k.value.to_string());
-                    if let Some(value) = value {
-                        let value = Resp::BulkString(value);
-                        stream.write_all(value.encode_to_string().as_bytes())?;
-                    } else {
-                        let null = Resp::NullBulkString;
-                        stream.write_all(null.encode_to_string().as_bytes())?;
+        RedisCommands::Get(key) => {
+            let value = redis_map.lock().unwrap()
+                .get(&key)
+                .filter(|k| {
+                    if let Some(expire) = k.expire {
+                        if let Ok(duration) = SystemTime::now().duration_since(k.timestamp) {
+                            return duration < Duration::from_millis(expire);
+                        }
                     }
-                    Ok(())
-                },
-                _ => Err(anyhow!("echo arg not found"))
+                    true
+                })
+                .map(|k| k.value.to_string());
+            if let Some(value) = value {
+                let value = Resp::BulkString(value);
+                stream.write_all(value.encode_to_string().as_bytes())?;
+            } else {
+                let null = Resp::NullBulkString;
+                stream.write_all(null.encode_to_string().as_bytes())?;
             }
+            Ok(())
+        },
+        RedisCommands::Info(info_section) => {
+            match info_section {
+                Some(InfoSection::Replication) => {
+                    let repl_info = Resp::BulkString("role:master".to_string());
+                    stream.write_all(repl_info.encode_to_string().as_bytes())?;
+                },
+                None => {
+                    let repl_info = Resp::BulkString("role:master".to_string());
+                    stream.write_all(repl_info.encode_to_string().as_bytes())?;
+                },
+            };
+            Ok(())
         },
     }
 }
