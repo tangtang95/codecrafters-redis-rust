@@ -20,14 +20,39 @@ struct ServerOptions {
     replicaof: Option<(String, u16)>
 }
 
-struct ServerInfo {
-    master_info: Option<MasterReplInfo>,
-    slave_info: Option<(String, u16)>
+struct ServerStatus {
+    port: u16,
+    server_type: ServerType,
 }
 
-struct MasterReplInfo {
+enum ServerType {
+    Master(MasterStatus),
+    Replica(ReplicaStatus)
+}
+
+struct MasterStatus {
     repl_id: String,
     repl_offset: u64
+}
+
+struct ReplicaStatus {
+    master_address: String,
+    master_port: u16
+}
+
+impl ServerType {
+    fn encode_to_info_string(&self) -> String {
+        match self {
+            ServerType::Master(status) => 
+                format!("role:master\r\n\
+                    master_replid:{}\r\n\
+                    master_repl_offset:{}", 
+                    status.repl_id, status.repl_offset
+                ),
+            ServerType::Replica(_) => 
+                "role:slave".to_string(),
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()>{
@@ -49,13 +74,13 @@ fn main() -> anyhow::Result<()>{
     println!("Redis listening on port {}", server_opts.port);
 
     let redis_map = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
-    let master_info = match server_opts.replicaof {
-        Some(_) => None,
-        None => Some(MasterReplInfo { repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), repl_offset: 0})
+    let server_type = match server_opts.replicaof {
+        Some((master_address, master_port)) => ServerType::Replica(ReplicaStatus { master_address, master_port }),
+        None => ServerType::Master(MasterStatus { repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), repl_offset: 0})
     };
-    let server_opts = Arc::new(Mutex::new(ServerInfo {
-        master_info,
-        slave_info: server_opts.replicaof
+    let server_opts = Arc::new(Mutex::new(ServerStatus {
+        port: server_opts.port,
+        server_type
     }));
 
     let mut socket_id: u64 = 0;
@@ -83,7 +108,7 @@ fn main() -> anyhow::Result<()>{
     Ok(())
 }
 
-fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_opts: Arc<Mutex<ServerInfo>>) -> anyhow::Result<()> {
+fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_opts: Arc<Mutex<ServerStatus>>) -> anyhow::Result<()> {
     loop {
         let mut bytes = [0u8; 512];
         let bytes_read = stream.read(&mut bytes)?;
@@ -99,7 +124,7 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
     }
 }
 
-fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_info: Arc<Mutex<ServerInfo>>) -> anyhow::Result<()> {
+fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_info: Arc<Mutex<ServerStatus>>) -> anyhow::Result<()> {
     match command {
         RedisCommands::Echo(text) => {
             let response = Resp::SimpleString(&text);
@@ -142,35 +167,13 @@ fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc
         RedisCommands::Info(info_section) => {
             match info_section {
                 Some(InfoSection::Replication) => {
-                    let response = {
-                        let server_info = server_info.lock().unwrap();
-                        let role = match server_info.slave_info {
-                            Some(_) => "slave",
-                            None => "master",
-                        };
-                        let master_response = match &server_info.master_info {
-                            Some(master_info) => format!("\r\nmaster_replid:{}\r\nmaster_repl_offset:{}", master_info.repl_id, master_info.repl_offset),
-                            None => String::new()
-                        };
-                        format!("role:{role}") + &master_response
-                    };
-                    let repl_info = Resp::BulkString(response);
+                    let info = server_info.lock().unwrap().server_type.encode_to_info_string();
+                    let repl_info = Resp::BulkString(info);
                     stream.write_all(repl_info.encode_to_string().as_bytes())?;
                 },
                 None => {
-                    let response = {
-                        let server_info = server_info.lock().unwrap();
-                        let role = match server_info.slave_info {
-                            Some(_) => "slave",
-                            None => "master",
-                        };
-                        let master_response = match &server_info.master_info {
-                            Some(master_info) => format!("\r\nmaster_replid:{}\r\nmaster_repl_offset:{}", master_info.repl_id, master_info.repl_offset),
-                            None => String::new()
-                        };
-                        format!("role:{role}") + &master_response
-                    };
-                    let repl_info = Resp::BulkString(response);
+                    let info = server_info.lock().unwrap().server_type.encode_to_info_string();
+                    let repl_info = Resp::BulkString(info);
                     stream.write_all(repl_info.encode_to_string().as_bytes())?;
                 },
             };
