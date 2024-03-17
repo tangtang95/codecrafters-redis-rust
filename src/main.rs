@@ -11,19 +11,31 @@ struct Value {
     timestamp: SystemTime
 }
 
+struct ServerOptions {
+    port: u16,
+    replicaof: Option<(String, u16)>
+}
+
 fn main() -> anyhow::Result<()>{
     let mut args = env::args();
-    let mut port = 6379u16;
+    let mut server_opts = ServerOptions { port: 6379, replicaof: None };
     while let Some(arg) = args.next() {
         if arg.eq("--port") {
             let port_text = args.next().ok_or(anyhow!("port arg not found"))?;
-            port = port_text.parse::<u16>().with_context(|| "port is not a number between 0 and 65536")?;
+            server_opts.port = port_text.parse::<u16>().with_context(|| "port is not a number between 0 and 65536")?;
+        }
+        if arg.eq("--replicaof") {
+            let master_host = args.next().ok_or(anyhow!("replicaof master host not found"))?;
+            let master_port = args.next().ok_or(anyhow!("replicaof master pord not found"))?;
+            let master_port = master_port.parse::<u16>().with_context(|| "master port is not a number between 0 and 65536")?;
+            server_opts.replicaof = Some((master_host, master_port));
         }
     }
-    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
-    println!("Redis listening on port {port}");
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", server_opts.port))?;
+    println!("Redis listening on port {}", server_opts.port);
 
     let redis_map = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
+    let server_opts = Arc::new(server_opts);
 
     let mut socket_id: u64 = 0;
     for stream in listener.incoming() {
@@ -31,10 +43,11 @@ fn main() -> anyhow::Result<()>{
             Ok(mut _stream) => {
                 let _socket_id = socket_id;
                 let redis_map = redis_map.clone();
+                let server_opts = server_opts.clone();
 
                 println!("accepted new connection socket {}", _socket_id);
                 thread::spawn(move || {
-                    match handle_client(_stream, redis_map) {
+                    match handle_client(_stream, redis_map, server_opts) {
                         Ok(_) => println!("connection {} handled correctly", _socket_id),
                         Err(err) => println!("{}", err),
                     }
@@ -49,7 +62,7 @@ fn main() -> anyhow::Result<()>{
     Ok(())
 }
 
-fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
+fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_opts: Arc<ServerOptions>) -> anyhow::Result<()> {
     loop {
         let mut bytes = [0u8; 512];
         let bytes_read = stream.read(&mut bytes)?;
@@ -61,7 +74,7 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
         println!("received: {}", buf);
         let (_, tokens) = tokenize(&buf)?;
         let command: RedisCommands = tokens.try_into()?;
-        handle_command(command, &mut stream, redis_map.clone())?;
+        handle_command(command, &mut stream, redis_map.clone(), server_opts.as_ref())?;
     }
 }
 
@@ -214,7 +227,7 @@ fn tokenize(resp: &str) -> anyhow::Result<(&str, Resp)> {
     }
 }
 
-fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
+fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_opts: &ServerOptions) -> anyhow::Result<()> {
     match command {
         RedisCommands::Echo(text) => {
             let response = Resp::SimpleString(&text);
@@ -257,11 +270,19 @@ fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc
         RedisCommands::Info(info_section) => {
             match info_section {
                 Some(InfoSection::Replication) => {
-                    let repl_info = Resp::BulkString("role:master".to_string());
+                    let role = match server_opts.replicaof {
+                        Some(_) => "slave",
+                        None => "master",
+                    };
+                    let repl_info = Resp::BulkString(format!("role:{role}").to_string());
                     stream.write_all(repl_info.encode_to_string().as_bytes())?;
                 },
                 None => {
-                    let repl_info = Resp::BulkString("role:master".to_string());
+                    let role = match server_opts.replicaof {
+                        Some(_) => "slave",
+                        None => "master",
+                    };
+                    let repl_info = Resp::BulkString(format!("role:{role}").to_string());
                     stream.write_all(repl_info.encode_to_string().as_bytes())?;
                 },
             };
