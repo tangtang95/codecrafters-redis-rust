@@ -4,9 +4,10 @@ use std::{
 };
 use anyhow::{anyhow, Context};
 
-use crate::resp_protocol::{tokenize, Resp};
+use crate::{tokenizer::{tokenize, Resp}, commands::{RedisCommands, InfoSection}};
 
-mod resp_protocol;
+mod tokenizer;
+mod commands;
 
 struct Value {
     value: String,
@@ -95,91 +96,6 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
         let (_, tokens) = tokenize(&buf)?;
         let command: RedisCommands = tokens.try_into()?;
         handle_command(command, &mut stream, redis_map.clone(), server_opts.clone())?;
-    }
-}
-
-
-enum RedisCommands {
-    Echo(String),
-    Ping,
-    Set(SetOptions),
-    Get(String),
-    Info(Option<InfoSection>),
-}
-
-struct SetOptions {
-    key: String,
-    value: String,
-    expire: Option<u64>
-}
-
-enum InfoSection {
-    Replication
-}
-
-impl TryFrom<&str> for InfoSection {
-    type Error = anyhow::Error;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value.to_lowercase().as_ref() {
-            "replication" => Ok(InfoSection::Replication),
-            section => Err(anyhow!("info section {section} not supported"))
-        }
-    }
-}
-
-impl<'a> TryFrom<Resp<'a>> for RedisCommands {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Resp<'a>) -> Result<Self, Self::Error> {
-        let Resp::Array(array) = value else { return Err(anyhow!("Command failed"))};
-        let Some(Resp::BulkString(command)) = array.first() else { return Err(anyhow!("Command failed"))};
-        match command.to_lowercase().as_ref() {
-            "ping" => Ok(RedisCommands::Ping),
-            "echo" => {
-                match array.get(1) {
-                    Some(Resp::BulkString(text)) => Ok(RedisCommands::Echo(text.to_string())),
-                    _ => Err(anyhow!("Echo arg not supported"))
-                }
-            },
-            "set" => { 
-                match array.get(1..3) {
-                    Some([Resp::BulkString(key), Resp::BulkString(value)]) => {
-                        let expire = match array.get(3..5) {
-                            Some([Resp::BulkString(option), Resp::BulkString(value)]) => {
-                                if option.eq_ignore_ascii_case("px") {
-                                    let value = value.parse::<u64>()?;
-                                    Some(value)
-                                } else {
-                                    None
-                                }
-                            },
-                            _ => None
-                        };
-                        Ok(RedisCommands::Set(SetOptions {
-                            key: key.to_string(),
-                            value: value.to_string(),
-                            expire
-                        }))
-                    },
-                    _ => Err(anyhow!("Set arg not supported"))
-                }
-            },
-            "get" => { 
-                match array.get(1) {
-                    Some(Resp::BulkString(text)) => Ok(RedisCommands::Get(text.to_string())),
-                    _ => Err(anyhow!("Get arg not supported"))
-                }
-            },
-            "info" => {
-                match array.get(1) {
-                    Some(Resp::BulkString(section)) => Ok(RedisCommands::Info(Some(section.as_str().try_into()?))),
-                    None => Ok(RedisCommands::Info(None)),
-                    _ => Err(anyhow!("Info arg not supported"))
-                }
-            },
-            _ => unimplemented!()
-        }
     }
 }
 

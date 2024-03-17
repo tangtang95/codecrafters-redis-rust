@@ -11,7 +11,7 @@ pub enum Resp<'a> {
 impl<'a> Resp<'a> {
     pub fn encode_to_string(&self) -> String {
         match self {
-            Resp::Array(_) => unimplemented!(),
+            Resp::Array(_) => todo!(),
             Resp::BulkString(string) => format!("${}\r\n{}\r\n", string.len(), string),
             Resp::SimpleString(string) => format!("+{}\r\n", string),
             Resp::Integer(num) => format!(":{}\r\n", num),
