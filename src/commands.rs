@@ -31,10 +31,10 @@ impl TryFrom<&str> for InfoSection {
     }
 }
 
-impl<'a> TryFrom<Resp<'a>> for RedisCommands {
+impl TryFrom<Resp> for RedisCommands {
     type Error = anyhow::Error;
 
-    fn try_from(value: Resp<'a>) -> Result<Self, Self::Error> {
+    fn try_from(value: Resp) -> Result<Self, Self::Error> {
         let Resp::Array(array) = value else { return Err(anyhow!("Command failed"))};
         let Some(Resp::BulkString(command)) = array.first() else { return Err(anyhow!("Command failed"))};
         match command.to_lowercase().as_ref() {

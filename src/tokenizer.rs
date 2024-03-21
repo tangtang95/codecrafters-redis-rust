@@ -1,14 +1,14 @@
 use anyhow::anyhow;
 
-pub enum Resp<'a> {
-    Array(Vec<Resp<'a>>),
+pub enum Resp {
+    Array(Vec<Resp>),
     BulkString(String),
-    SimpleString(&'a str),
+    SimpleString(String),
     Integer(i64),
     NullBulkString
 }
 
-impl<'a> Resp<'a> {
+impl Resp {
     pub fn encode_to_string(&self) -> String {
         match self {
             Resp::Array(_) => todo!(),

@@ -125,23 +125,17 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
 }
 
 fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_info: Arc<Mutex<ServerStatus>>) -> anyhow::Result<()> {
-    match command {
+    let response = match command {
         RedisCommands::Echo(text) => {
-            let response = Resp::SimpleString(&text);
-            stream.write_all(response.encode_to_string().as_bytes())?;
-            Ok(())
+            Resp::SimpleString(text)
         },
         RedisCommands::Ping => {
-            let pong = Resp::SimpleString("PONG");
-            stream.write_all(pong.encode_to_string().as_bytes())?;
-            Ok(())
+            Resp::SimpleString("PONG".to_string())
         },
         RedisCommands::Set(options) => {
             redis_map.lock().unwrap()
                 .insert(options.key, Value { value: options.value, expire: options.expire, timestamp: SystemTime::now() });
-            let ok = Resp::SimpleString("OK");
-            stream.write_all(ok.encode_to_string().as_bytes())?;
-            Ok(())
+            Resp::SimpleString("OK".to_string())
         },
         RedisCommands::Get(key) => {
             let value = redis_map.lock().unwrap()
@@ -155,29 +149,21 @@ fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc
                     true
                 })
                 .map(|k| k.value.to_string());
-            if let Some(value) = value {
-                let value = Resp::BulkString(value);
-                stream.write_all(value.encode_to_string().as_bytes())?;
-            } else {
-                let null = Resp::NullBulkString;
-                stream.write_all(null.encode_to_string().as_bytes())?;
-            }
-            Ok(())
+            if let Some(value) = value { Resp::BulkString(value) } else { Resp::NullBulkString }
         },
         RedisCommands::Info(info_section) => {
             match info_section {
                 Some(InfoSection::Replication) => {
                     let info = server_info.lock().unwrap().server_type.encode_to_info_string();
-                    let repl_info = Resp::BulkString(info);
-                    stream.write_all(repl_info.encode_to_string().as_bytes())?;
+                    Resp::BulkString(info)
                 },
                 None => {
                     let info = server_info.lock().unwrap().server_type.encode_to_info_string();
-                    let repl_info = Resp::BulkString(info);
-                    stream.write_all(repl_info.encode_to_string().as_bytes())?;
+                    Resp::BulkString(info)
                 },
-            };
-            Ok(())
+            }
         },
-    }
+    };
+    stream.write_all(response.encode_to_string().as_bytes())?;
+    Ok(())
 }
