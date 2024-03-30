@@ -11,7 +11,13 @@ pub enum Resp {
 impl Resp {
     pub fn encode_to_string(&self) -> String {
         match self {
-            Resp::Array(_) => todo!(),
+            Resp::Array(vector) => {
+                let mut encoded = format!("*{}\r\n", vector.len());
+                for val in vector {
+                    encoded += &val.encode_to_string()
+                }
+                encoded
+            },
             Resp::BulkString(string) => format!("${}\r\n{}\r\n", string.len(), string),
             Resp::SimpleString(string) => format!("+{}\r\n", string),
             Resp::Integer(num) => format!(":{}\r\n", num),

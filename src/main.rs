@@ -78,6 +78,12 @@ fn main() -> anyhow::Result<()>{
         Some((master_address, master_port)) => ServerType::Replica(ReplicaStatus { master_address, master_port }),
         None => ServerType::Master(MasterStatus { repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), repl_offset: 0})
     };
+
+    if let ServerType::Replica(replica_status) = &server_type {
+        let replica_info = ReplicaStatus { master_address: replica_status.master_address.clone(), master_port: replica_status.master_port };
+        connect_master(replica_info)?;
+    }
+
     let server_opts = Arc::new(Mutex::new(ServerStatus {
         port: server_opts.port,
         server_type
@@ -105,6 +111,13 @@ fn main() -> anyhow::Result<()>{
             }
         }
     }
+    Ok(())
+}
+
+fn connect_master(replica_info: ReplicaStatus) -> anyhow::Result<()> {
+    let mut stream = TcpStream::connect(format!("{}:{}", replica_info.master_address, replica_info.master_port))?;
+    let ping_message = Resp::Array(vec![Resp::BulkString("ping".to_string())]);
+    stream.write_all(ping_message.encode_to_string().as_bytes())?;
     Ok(())
 }
 
