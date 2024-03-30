@@ -232,6 +232,18 @@ fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc
         },
         RedisCommands::ReplConf(_) => {
             Resp::SimpleString("OK".to_string())
+        },
+        RedisCommands::PSync(repl_id, repl_offset) => {
+            match (repl_id.as_ref(), repl_offset) {
+                ("?", -1) => {
+                    let (master_repl_id, master_repl_offset) = match &server_info.lock().unwrap().server_type {
+                        ServerType::Master(master_status) => (master_status.repl_id.clone(), master_status.repl_offset),
+                        ServerType::Replica(_) => unimplemented!(),
+                    };
+                    Resp::SimpleString(format!("FULLRESYNC {} {}", master_repl_id, master_repl_offset))
+                },
+                _ => unimplemented!()
+            }
         }
     };
     stream.write_all(response.encode_to_string().as_bytes())?;

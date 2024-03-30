@@ -8,7 +8,8 @@ pub enum RedisCommands {
     Set(SetOptions),
     Get(String),
     Info(Option<InfoSection>),
-    ReplConf(ReplConfMode)
+    ReplConf(ReplConfMode),
+    PSync(String, i64)
 }
 
 pub struct SetOptions {
@@ -107,6 +108,12 @@ impl TryFrom<Resp> for RedisCommands {
                 let Some(Resp::BulkString(mode_arg)) = array.get(2) else { return Err(anyhow!("ReplConf second arg missing")) };
                 let mode = ReplConfMode::try_from((mode.as_ref(), mode_arg.as_ref()))?;
                 Ok(RedisCommands::ReplConf(mode))
+            },
+            "psync" => {
+                let Some(Resp::BulkString(repl_id)) = array.get(1) else { return Err(anyhow!("PSync repl_id missing")) };
+                let Some(Resp::BulkString(repl_offset)) = array.get(2) else { return Err(anyhow!("PSync repl_offset missing")) };
+                let repl_offset = repl_offset.parse::<i64>()?;
+                Ok(RedisCommands::PSync(repl_id.to_string(), repl_offset))
             },
             _ => unimplemented!()
         }
