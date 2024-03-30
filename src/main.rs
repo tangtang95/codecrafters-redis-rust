@@ -169,13 +169,9 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
     ]);
     stream.write_all(psync.encode_to_string().as_bytes())?;
     println!("replica sent psync message");
+    
+    //ignore response for now
 
-    let mut bytes = [0u8; 512];
-    let _ = stream.read(&mut bytes)?;
-    println!("bytes received: {:?}", bytes);
-    let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
-    println!("replica handshake received: {}", buf);
-    let (_, _) = tokenize(&buf)?;
     Ok(())
 }
 
