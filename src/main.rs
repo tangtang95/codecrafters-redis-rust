@@ -21,7 +21,6 @@ struct ServerOptions {
 }
 
 struct ServerStatus {
-    port: u16,
     server_type: ServerType,
 }
 
@@ -85,7 +84,6 @@ fn main() -> anyhow::Result<()>{
     }
 
     let server_opts = Arc::new(Mutex::new(ServerStatus {
-        port: server_opts.port,
         server_type
     }));
 
@@ -136,6 +134,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
         Resp::BulkString(format!("{}", port))
     ]);
     stream.write_all(replconf.encode_to_string().as_bytes())?;
+    println!("replica sent first replconf message");
 
     let mut bytes = [0u8; 512];
     let _ = stream.read(&mut bytes)?;
@@ -152,6 +151,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
         Resp::BulkString("psync2".to_string()),
     ]);
     stream.write_all(replconf.encode_to_string().as_bytes())?;
+    println!("replica sent first replconf message");
 
     let mut bytes = [0u8; 512];
     let _ = stream.read(&mut bytes)?;
