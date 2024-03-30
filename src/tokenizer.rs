@@ -64,6 +64,12 @@ pub fn tokenize(buffer: &str) -> anyhow::Result<(&str, Resp)> {
             let remainder = buffer.get(line.len()+2..).ok_or(anyhow!("RESP out of bounds"))?;
             Ok((remainder, Resp::Integer(integer)))
         },
+        "+" => {
+            let line = buffer.lines().next().ok_or(anyhow!("RESP next line not found"))?;
+            let simple_str = line.trim_start_matches('+');
+            let remainder = buffer.get(line.len()+2..).ok_or(anyhow!("RESP out of bounds"))?;
+            Ok((remainder, Resp::SimpleString(simple_str.to_string())))
+        },
         _ => {
             println!("RESP type `{:?}` not implemented", resp_type);
             unimplemented!()
