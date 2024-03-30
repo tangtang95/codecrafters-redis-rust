@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()>{
 
     if let ServerType::Replica(replica_status) = &server_type {
         let replica_info = ReplicaStatus { master_address: replica_status.master_address.clone(), master_port: replica_status.master_port };
-        connect_master(replica_info)?;
+        connect_master(replica_info, server_opts.port)?;
     }
 
     let server_opts = Arc::new(Mutex::new(ServerStatus {
@@ -114,10 +114,53 @@ fn main() -> anyhow::Result<()>{
     Ok(())
 }
 
-fn connect_master(replica_info: ReplicaStatus) -> anyhow::Result<()> {
+fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(format!("{}:{}", replica_info.master_address, replica_info.master_port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let ping_message = Resp::Array(vec![Resp::BulkString("ping".to_string())]);
     stream.write_all(ping_message.encode_to_string().as_bytes())?;
+    println!("replica sent ping message");
+
+    let mut bytes = [0u8; 512];
+    let _ = stream.read(&mut bytes)?;
+    let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
+    println!("replica handshake received: {}", buf);
+    let (_, tokens) = tokenize(&buf)?;
+    if !tokens.eq(&Resp::SimpleString("PONG".to_string())) {
+        return Err(anyhow!("wrong response from master"))
+    }
+
+    let replconf = Resp::Array(vec![
+        Resp::BulkString("REPLCONF".to_string()),
+        Resp::BulkString("listening-port".to_string()),
+        Resp::BulkString(format!("{}", port))
+    ]);
+    stream.write_all(replconf.encode_to_string().as_bytes())?;
+
+    let mut bytes = [0u8; 512];
+    let _ = stream.read(&mut bytes)?;
+    let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
+    println!("replica handshake received: {}", buf);
+    let (_, tokens) = tokenize(&buf)?;
+    if !tokens.eq(&Resp::SimpleString("OK".to_string())) {
+        return Err(anyhow!("wrong response from master"))
+    }
+
+    let replconf = Resp::Array(vec![
+        Resp::BulkString("REPLCONF".to_string()),
+        Resp::BulkString("capa".to_string()),
+        Resp::BulkString("psync2".to_string()),
+    ]);
+    stream.write_all(replconf.encode_to_string().as_bytes())?;
+
+    let mut bytes = [0u8; 512];
+    let _ = stream.read(&mut bytes)?;
+    let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
+    println!("replica handshake received: {}", buf);
+    let (_, tokens) = tokenize(&buf)?;
+    if !tokens.eq(&Resp::SimpleString("OK".to_string())) {
+        return Err(anyhow!("wrong response from master"))
+    }
     Ok(())
 }
 

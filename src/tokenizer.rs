@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 
+#[derive(PartialEq, Eq)]
 pub enum Resp {
     Array(Vec<Resp>),
     BulkString(String),
