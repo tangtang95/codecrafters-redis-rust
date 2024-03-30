@@ -151,7 +151,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
         Resp::BulkString("psync2".to_string()),
     ]);
     stream.write_all(replconf.encode_to_string().as_bytes())?;
-    println!("replica sent first replconf message");
+    println!("replica sent second replconf message");
 
     let mut bytes = [0u8; 512];
     let _ = stream.read(&mut bytes)?;
@@ -162,15 +162,17 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
         return Err(anyhow!("wrong response from master"))
     }
 
-    let replconf = Resp::Array(vec![
+    let psync = Resp::Array(vec![
         Resp::BulkString("PSYNC".to_string()),
         Resp::BulkString("?".to_string()),
         Resp::BulkString("-1".to_string()),
     ]);
-    stream.write_all(replconf.encode_to_string().as_bytes())?;
+    stream.write_all(psync.encode_to_string().as_bytes())?;
+    println!("replica sent psync message");
 
     let mut bytes = [0u8; 512];
     let _ = stream.read(&mut bytes)?;
+    println!("bytes received: {:?}", bytes);
     let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
     println!("replica handshake received: {}", buf);
     let (_, _) = tokenize(&buf)?;
