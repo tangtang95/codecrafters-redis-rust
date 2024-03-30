@@ -61,12 +61,13 @@ fn main() -> anyhow::Result<()>{
         if arg.eq("--port") {
             let port_text = args.next().ok_or(anyhow!("port arg not found"))?;
             server_opts.port = port_text.parse::<u16>().with_context(|| "port is not a number between 0 and 65536")?;
-        }
-        if arg.eq("--replicaof") {
+        } else if arg.eq("--replicaof") {
             let master_host = args.next().ok_or(anyhow!("replicaof master host not found"))?;
             let master_port = args.next().ok_or(anyhow!("replicaof master pord not found"))?;
             let master_port = master_port.parse::<u16>().with_context(|| "master port is not a number between 0 and 65536")?;
             server_opts.replicaof = Some((master_host, master_port));
+        } else {
+            return Err(anyhow!("invalid cli arg \"{arg}\""))
         }
     }
     let listener = TcpListener::bind(format!("127.0.0.1:{}", server_opts.port))?;
@@ -193,12 +194,8 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
 
 fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_info: Arc<Mutex<ServerStatus>>) -> anyhow::Result<()> {
     let response = match command {
-        RedisCommands::Echo(text) => {
-            Resp::SimpleString(text)
-        },
-        RedisCommands::Ping => {
-            Resp::SimpleString("PONG".to_string())
-        },
+        RedisCommands::Echo(text) => Resp::SimpleString(text),
+        RedisCommands::Ping => Resp::SimpleString("PONG".to_string()),
         RedisCommands::Set(options) => {
             redis_map.lock().unwrap()
                 .insert(options.key, Value { value: options.value, expire: options.expire, timestamp: SystemTime::now() });
