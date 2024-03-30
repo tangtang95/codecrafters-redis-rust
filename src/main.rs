@@ -57,6 +57,7 @@ impl ServerType {
 fn main() -> anyhow::Result<()>{
     let mut args = env::args();
     let mut server_opts = ServerOptions { port: 6379, replicaof: None };
+    let _ = args.next();
     while let Some(arg) = args.next() {
         if arg.eq("--port") {
             let port_text = args.next().ok_or(anyhow!("port arg not found"))?;
