@@ -230,6 +230,9 @@ fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc
                 },
             }
         },
+        RedisCommands::ReplConf(_) => {
+            Resp::SimpleString("OK".to_string())
+        }
     };
     stream.write_all(response.encode_to_string().as_bytes())?;
     Ok(())

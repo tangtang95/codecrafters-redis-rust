@@ -8,6 +8,7 @@ pub enum RedisCommands {
     Set(SetOptions),
     Get(String),
     Info(Option<InfoSection>),
+    ReplConf(ReplConfMode)
 }
 
 pub struct SetOptions {
@@ -27,6 +28,26 @@ impl TryFrom<&str> for InfoSection {
         match value.to_lowercase().as_ref() {
             "replication" => Ok(InfoSection::Replication),
             section => Err(anyhow!("info section {section} not supported"))
+        }
+    }
+}
+
+pub enum ReplConfMode {
+    ListeningPort(u16),
+    Capability(String)
+}
+
+impl TryFrom<(&str, &str)> for ReplConfMode {
+    type Error = anyhow::Error;
+
+    fn try_from(value: (&str, &str)) -> Result<Self, Self::Error> {
+        match value.0.to_lowercase().as_ref() {
+            "listening-port" => {
+                let port = value.1.parse::<u16>()?;
+                Ok(ReplConfMode::ListeningPort(port))
+            },
+            "capa" => Ok(ReplConfMode::Capability(value.1.to_string())),
+            mode => Err(anyhow!("info section {mode} not supported"))
         }
     }
 }
@@ -80,6 +101,12 @@ impl TryFrom<Resp> for RedisCommands {
                     None => Ok(RedisCommands::Info(None)),
                     _ => Err(anyhow!("Info arg not supported"))
                 }
+            },
+            "replconf" => {
+                let Some(Resp::BulkString(mode)) = array.get(1) else { return Err(anyhow!("ReplConf mode missing")) };
+                let Some(Resp::BulkString(mode_arg)) = array.get(2) else { return Err(anyhow!("ReplConf second arg missing")) };
+                let mode = ReplConfMode::try_from((mode.as_ref(), mode_arg.as_ref()))?;
+                Ok(RedisCommands::ReplConf(mode))
             },
             _ => unimplemented!()
         }
