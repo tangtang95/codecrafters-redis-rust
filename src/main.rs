@@ -220,6 +220,7 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
         if let RedisCommands::PSync(_, _) = command {
             if let ServerType::Master(ref mut master_status) = server_opts.lock().unwrap().server_type {
                 master_status.repl_tcp_streams.push(stream);
+                println!("master added a replica");
                 return Ok(());
             }
         }
