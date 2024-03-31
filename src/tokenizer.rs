@@ -6,7 +6,8 @@ pub enum Resp {
     BulkString(String),
     SimpleString(String),
     Integer(i64),
-    NullBulkString
+    NullBulkString,
+    Empty
 }
 
 impl Resp {
@@ -23,6 +24,24 @@ impl Resp {
             Resp::SimpleString(string) => format!("+{}\r\n", string),
             Resp::Integer(num) => format!(":{}\r\n", num),
             Resp::NullBulkString => "$-1\r\n".to_string(),
+            Resp::Empty => String::new()
+        }
+    }
+
+    pub fn encode_to_bytes(&self) -> Vec<u8> {
+        match self {
+            Resp::Array(vector) => {
+                let mut encoded = [b"*", vector.len().to_string().as_bytes(), b"\r\n"].concat();
+                for val in vector {
+                    encoded = [encoded, val.encode_to_bytes()].concat();
+                }
+                encoded
+            },
+            Resp::BulkString(string) => [b"$", string.len().to_string().as_bytes(), b"\r\n", string.as_bytes(), b"\r\n"].concat(),
+            Resp::SimpleString(string) => [b"+", string.as_bytes(), b"\r\n"].concat(),
+            Resp::Integer(num) => [b":", num.to_string().as_bytes(), b"\r\n"].concat(),
+            Resp::NullBulkString => b"$-1\r\n".to_vec(),
+            Resp::Empty => vec![]
         }
     }
 }

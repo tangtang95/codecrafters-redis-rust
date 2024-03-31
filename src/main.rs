@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex}, time::{SystemTime, Duration}, env,
+    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex}, time::{SystemTime, Duration}, env, num::ParseIntError,
 };
 use anyhow::{anyhow, Context};
 
@@ -8,6 +8,8 @@ use crate::{tokenizer::{Resp, tokenize_bytes}, commands::{RedisCommands, InfoSec
 
 mod tokenizer;
 mod commands;
+
+const EMPTY_RDB: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
 struct Value {
     value: String,
@@ -237,7 +239,11 @@ fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc
                         ServerType::Master(master_status) => (master_status.repl_id.clone(), master_status.repl_offset),
                         ServerType::Replica(_) => unimplemented!(),
                     };
-                    Resp::SimpleString(format!("FULLRESYNC {} {}", master_repl_id, master_repl_offset))
+                    let response = Resp::SimpleString(format!("FULLRESYNC {} {}", master_repl_id, master_repl_offset));
+                    stream.write_all(&response.encode_to_bytes())?;
+                    let empty_rdb_bytes = decode_hex(EMPTY_RDB)?;
+                    stream.write_all(&[b"$", empty_rdb_bytes.len().to_string().as_bytes(), b"\r\n", &empty_rdb_bytes].concat())?;
+                    Resp::Empty
                 },
                 _ => unimplemented!()
             }
@@ -245,4 +251,11 @@ fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc
     };
     stream.write_all(response.encode_to_string().as_bytes())?;
     Ok(())
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+        .collect()
 }
