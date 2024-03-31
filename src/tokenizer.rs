@@ -60,7 +60,7 @@ pub fn tokenize_bytes(buffer: &[u8]) -> anyhow::Result<(&[u8], Resp)> {
             }
             Ok((remainder, Resp::Array(vec)))
         },
-       b'$' => {
+        b'$' => {
             let (remainder, line_bytes) = read_next_line(buffer)?;
             let len = String::from_utf8(line_bytes[1..].to_vec())?.parse::<usize>()?;
             let (remainder, line_bytes) = read_next_line(remainder)?;

@@ -33,7 +33,8 @@ enum ServerType {
 
 struct MasterStatus {
     repl_id: String,
-    repl_offset: u64
+    repl_offset: u64,
+    repl_tcp_streams: Vec<TcpStream>
 }
 
 struct ReplicaStatus {
@@ -79,12 +80,22 @@ fn main() -> anyhow::Result<()>{
     let redis_map = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
     let server_type = match server_opts.replicaof {
         Some((master_address, master_port)) => ServerType::Replica(ReplicaStatus { master_address, master_port }),
-        None => ServerType::Master(MasterStatus { repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), repl_offset: 0})
+        None => ServerType::Master(MasterStatus { 
+            repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
+            repl_offset: 0,
+            repl_tcp_streams: Vec::new() 
+        })
     };
 
     if let ServerType::Replica(replica_status) = &server_type {
         let replica_info = ReplicaStatus { master_address: replica_status.master_address.clone(), master_port: replica_status.master_port };
-        connect_master(replica_info, server_opts.port)?;
+        let redis_map = redis_map.clone();
+        thread::spawn(move || {
+            match connect_master(replica_info, server_opts.port, redis_map) {
+                Ok(_) => println!("connection with master handled correctly"),
+                Err(err) => println!("{}", err),
+            }
+        });
     }
 
     let server_opts = Arc::new(Mutex::new(ServerStatus {
@@ -116,7 +127,7 @@ fn main() -> anyhow::Result<()>{
     Ok(())
 }
 
-fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> {
+fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(format!("{}:{}", replica_info.master_address, replica_info.master_port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let ping_message = Resp::Array(vec![Resp::BulkString("ping".to_string())]);
@@ -176,7 +187,22 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
     let (_, tokens) = tokenize_bytes(&bytes)?;
     println!("replica handshake received: {:?}", tokens);
 
-    Ok(())
+    stream.set_read_timeout(None)?;
+    loop {
+        let mut bytes = [0u8; 512];
+        let bytes_read = stream.read(&mut bytes)?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+
+        let (_, tokens) = tokenize_bytes(&bytes)?;
+        println!("replica received: {:?}", tokens);
+        let command: RedisCommands = tokens.try_into()?;
+        if let RedisCommands::Set(opts) = command {
+            redis_map.lock().unwrap()
+                .insert(opts.key.to_string(), Value { value: opts.value.to_string(), expire: opts.expire, timestamp: SystemTime::now() });
+        }
+    }
 }
 
 fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_opts: Arc<Mutex<ServerStatus>>) -> anyhow::Result<()> {
@@ -190,22 +216,38 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
         let (_, tokens) = tokenize_bytes(&bytes)?;
         println!("received: {:?}", tokens);
         let command: RedisCommands = tokens.try_into()?;
-        handle_command(command, &mut stream, redis_map.clone(), server_opts.clone())?;
+        handle_command(&command, &mut stream, &redis_map, &server_opts)?;
+        if let RedisCommands::PSync(_, _) = command {
+            if let ServerType::Master(ref mut master_status) = server_opts.lock().unwrap().server_type {
+                master_status.repl_tcp_streams.push(stream);
+                return Ok(());
+            }
+        }
     }
 }
 
-fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_info: Arc<Mutex<ServerStatus>>) -> anyhow::Result<()> {
+fn handle_command(command: &RedisCommands, stream: &mut TcpStream, redis_map: &Arc<Mutex<HashMap<String, Value>>>, server_info: &Arc<Mutex<ServerStatus>>) -> anyhow::Result<()> {
     let response = match command {
-        RedisCommands::Echo(text) => Resp::SimpleString(text),
+        RedisCommands::Echo(text) => Resp::SimpleString(text.to_string()),
         RedisCommands::Ping => Resp::SimpleString("PONG".to_string()),
         RedisCommands::Set(options) => {
             redis_map.lock().unwrap()
-                .insert(options.key, Value { value: options.value, expire: options.expire, timestamp: SystemTime::now() });
+                .insert(options.key.to_string(), Value { value: options.value.to_string(), expire: options.expire, timestamp: SystemTime::now() });
+            if let ServerType::Master(ref mut master_status) = server_info.lock().unwrap().server_type {
+                for repl_stream in &mut master_status.repl_tcp_streams {
+                    let set_command = Resp::Array(vec![
+                        Resp::BulkString("SET".to_string()),
+                        Resp::BulkString(options.key.to_string()),
+                        Resp::BulkString(options.value.to_string()),
+                    ]);
+                    repl_stream.write_all(&set_command.encode_to_bytes())?;
+                }
+            }
             Resp::SimpleString("OK".to_string())
         },
         RedisCommands::Get(key) => {
             let value = redis_map.lock().unwrap()
-                .get(&key)
+                .get(key)
                 .filter(|k| {
                     if let Some(expire) = k.expire {
                         if let Ok(duration) = SystemTime::now().duration_since(k.timestamp) {
@@ -240,9 +282,9 @@ fn handle_command(command: RedisCommands, stream: &mut TcpStream, redis_map: Arc
                         ServerType::Replica(_) => unimplemented!(),
                     };
                     let response = Resp::SimpleString(format!("FULLRESYNC {} {}", master_repl_id, master_repl_offset));
-                    stream.write_all(&response.encode_to_bytes())?;
                     let empty_rdb_bytes = decode_hex(EMPTY_RDB)?;
-                    stream.write_all(&[b"$", empty_rdb_bytes.len().to_string().as_bytes(), b"\r\n", &empty_rdb_bytes].concat())?;
+                    let empty_rdb_bytes = [b"$", empty_rdb_bytes.len().to_string().as_bytes(), b"\r\n", &empty_rdb_bytes].concat();
+                    stream.write_all(&[&response.encode_to_bytes(), empty_rdb_bytes.as_slice()].concat())?;
                     Resp::Empty
                 },
                 _ => unimplemented!()
