@@ -4,7 +4,7 @@ use std::{
 };
 use anyhow::{anyhow, Context};
 
-use crate::{tokenizer::{tokenize, Resp}, commands::{RedisCommands, InfoSection}};
+use crate::{tokenizer::{Resp, tokenize_bytes}, commands::{RedisCommands, InfoSection}};
 
 mod tokenizer;
 mod commands;
@@ -123,9 +123,8 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
 
     let mut bytes = [0u8; 512];
     let _ = stream.read(&mut bytes)?;
-    let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
-    println!("replica handshake received: {}", buf);
-    let (_, tokens) = tokenize(&buf)?;
+    let (_, tokens) = tokenize_bytes(&bytes)?;
+    println!("replica handshake received: {:?}", tokens);
     if !tokens.eq(&Resp::SimpleString("PONG".to_string())) {
         return Err(anyhow!("wrong response from master"))
     }
@@ -140,9 +139,8 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
 
     let mut bytes = [0u8; 512];
     let _ = stream.read(&mut bytes)?;
-    let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
-    println!("replica handshake received: {}", buf);
-    let (_, tokens) = tokenize(&buf)?;
+    let (_, tokens) = tokenize_bytes(&bytes)?;
+    println!("replica handshake received: {:?}", tokens);
     if !tokens.eq(&Resp::SimpleString("OK".to_string())) {
         return Err(anyhow!("wrong response from master"))
     }
@@ -157,9 +155,8 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
 
     let mut bytes = [0u8; 512];
     let _ = stream.read(&mut bytes)?;
-    let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
-    println!("replica handshake received: {}", buf);
-    let (_, tokens) = tokenize(&buf)?;
+    let (_, tokens) = tokenize_bytes(&bytes)?;
+    println!("replica handshake received: {:?}", tokens);
     if !tokens.eq(&Resp::SimpleString("OK".to_string())) {
         return Err(anyhow!("wrong response from master"))
     }
@@ -171,8 +168,11 @@ fn connect_master(replica_info: ReplicaStatus, port: u16) -> anyhow::Result<()> 
     ]);
     stream.write_all(psync.encode_to_string().as_bytes())?;
     println!("replica sent psync message");
-    
-    //ignore response for now
+
+    let mut bytes = [0u8; 512];
+    let _ = stream.read(&mut bytes)?;
+    let (_, tokens) = tokenize_bytes(&bytes)?;
+    println!("replica handshake received: {:?}", tokens);
 
     Ok(())
 }
@@ -185,9 +185,8 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
             return Ok(());
         }
 
-        let buf = String::from_utf8(bytes.to_vec())?.trim_end_matches('\0').to_string();
-        println!("received: {}", buf);
-        let (_, tokens) = tokenize(&buf)?;
+        let (_, tokens) = tokenize_bytes(&bytes)?;
+        println!("received: {:?}", tokens);
         let command: RedisCommands = tokens.try_into()?;
         handle_command(command, &mut stream, redis_map.clone(), server_opts.clone())?;
     }

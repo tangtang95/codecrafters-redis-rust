@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Resp {
     Array(Vec<Resp>),
     BulkString(String),
@@ -27,52 +27,52 @@ impl Resp {
     }
 }
 
-pub fn tokenize(buffer: &str) -> anyhow::Result<(&str, Resp)> {
-    let resp_type = buffer.get(0..1).ok_or(anyhow!("RESP type not found"))?;
-    match resp_type {
-       "*" => {
-            let line = buffer.lines().next().ok_or(anyhow!("RESP next line not found"))?;
-            let len = line.trim_start_matches('*').parse::<usize>()?;
+pub fn tokenize_bytes(buffer: &[u8]) -> anyhow::Result<(&[u8], Resp)> {
+    let value_type = buffer.first().ok_or(anyhow!("RESP type not found"))?;
+    match value_type {
+        b'*' => {
+            let (mut remainder, line_bytes) = read_next_line(buffer)?;
+            let len = String::from_utf8(line_bytes[1..].to_vec())?.parse::<usize>()?;
             let mut vec: Vec<Resp> = Vec::new();
-            let mut remainder = buffer.get(line.len()+2..).ok_or(anyhow!("RESP out of bounds"))?;
             for _ in 0..len {
-                let (new_remainder, child_resp) = tokenize(remainder)?;
+                let (new_remainder, child_resp) = tokenize_bytes(remainder)?;
                 vec.push(child_resp);
                 remainder = new_remainder;
             }
             Ok((remainder, Resp::Array(vec)))
         },
-       "$" => {
-            let mut consumed_len = 0;
-            let mut line_iter = buffer.lines();
-            let line = line_iter.next().ok_or(anyhow!("RESP next line not found"))?;
-            consumed_len += line.len() + 2;
-            let len = line.trim_start_matches('$').parse::<usize>()?;
-
-            let line = line_iter.next().ok_or(anyhow!("RESP next line not found"))?;
-            if len != line.trim_end().len() {
-                return Err(anyhow!("RESP bulk string len does not coincide"));
-            }
-            consumed_len += line.len() + 2;
-
-            let remainder = buffer.get(consumed_len..).ok_or(anyhow!("RESP out of bounds"))?;
-            Ok((remainder, Resp::BulkString(line.to_owned())))
+       b'$' => {
+            let (remainder, line_bytes) = read_next_line(buffer)?;
+            let len = String::from_utf8(line_bytes[1..].to_vec())?.parse::<usize>()?;
+            let (remainder, line_bytes) = read_next_line(remainder)?;
+            let text = String::from_utf8(line_bytes[..].to_vec())?;
+            if len != text.len() { return Err(anyhow!("RESP bulk string len does not coincide")); }
+            Ok((remainder, Resp::BulkString(text.to_owned())))
         },
-        ":" => {
-            let line = buffer.lines().next().ok_or(anyhow!("RESP next line not found"))?;
-            let integer = line.trim_start_matches(':').parse::<i64>()?;
-            let remainder = buffer.get(line.len()+2..).ok_or(anyhow!("RESP out of bounds"))?;
+        b':' => {
+            let (remainder, line_bytes) = read_next_line(buffer)?;
+            let integer = String::from_utf8(line_bytes[1..].to_vec())?.parse::<i64>()?;
             Ok((remainder, Resp::Integer(integer)))
         },
-        "+" => {
-            let line = buffer.lines().next().ok_or(anyhow!("RESP next line not found"))?;
-            let simple_str = line.trim_start_matches('+');
-            let remainder = buffer.get(line.len()+2..).ok_or(anyhow!("RESP out of bounds"))?;
-            Ok((remainder, Resp::SimpleString(simple_str.to_string())))
+        b'+' => {
+            let (remainder, line_bytes) = read_next_line(buffer)?;
+            let text = String::from_utf8(line_bytes[1..].to_vec())?;
+            Ok((remainder, Resp::SimpleString(text.to_string())))
         },
         _ => {
-            println!("RESP type `{:?}` not implemented", resp_type);
+            println!("RESP type `{:?}` not implemented", value_type);
             unimplemented!()
         }
     }
 }
+
+pub fn read_next_line(buffer: &[u8]) -> anyhow::Result<(&[u8], &[u8])> {
+    let (next_rn_idx, next_line_idx) = match buffer.windows(2).position(|bytes| bytes == b"\r\n") {
+        Some(index) => (index, index + 2),
+        None => (buffer.len(), buffer.len())
+    };
+    let line_bytes = buffer.get(..next_rn_idx).ok_or(anyhow!("RESP next line not found"))?;
+    let remainder = buffer.get(next_line_idx..).ok_or(anyhow!("RESP remainder not found"))?;
+    Ok((remainder, line_bytes))
+}
+
