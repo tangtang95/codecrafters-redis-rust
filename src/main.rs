@@ -220,9 +220,18 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
         let (_, tokens) = tokenize_bytes(&bytes)?;
         println!("replica received from master: {:?}", tokens);
         let command: RedisCommands = tokens.try_into()?;
-        if let RedisCommands::Set(opts) = command {
-            redis_map.lock().unwrap()
-                .insert(opts.key.to_string(), Value { value: opts.value.to_string(), expire: opts.expire, timestamp: SystemTime::now() });
+        match command {
+            RedisCommands::Set(opts) => {
+                redis_map.lock().unwrap()
+                    .insert(opts.key.to_string(), Value { value: opts.value.to_string(), expire: opts.expire, timestamp: SystemTime::now() });
+            },
+            RedisCommands::ReplConf(commands::ReplConfMode::GetAck(_)) => {
+                let response = RedisCommands::ReplConf(commands::ReplConfMode::Ack(0));
+                stream.write_all(&Resp::from(response).encode_to_bytes())?;
+            },
+            _ => {
+                println!("replica ignore command from master: {:?}", command);
+            }
         }
     }
 }

@@ -2,7 +2,7 @@ use anyhow::anyhow;
 
 use crate::tokenizer::Resp;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum RedisCommands {
     Echo(String),
     Ping,
@@ -13,7 +13,7 @@ pub enum RedisCommands {
     PSync(String, i64)
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SetOptions {
     pub key: String,
     pub value: String,
@@ -21,7 +21,7 @@ pub struct SetOptions {
 }
 
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum InfoSection {
     Replication
 }
@@ -37,18 +37,20 @@ impl TryFrom<&str> for InfoSection {
     }
 }
 
-impl Into<Resp> for InfoSection {
-    fn into(self) -> Resp {
-        match self {
-            Self::Replication => Resp::BulkString("REPLICATION".to_string()),
+impl From<InfoSection> for Resp {
+    fn from(val: InfoSection) -> Self {
+        match val {
+            InfoSection::Replication => Resp::BulkString("REPLICATION".to_string()),
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum ReplConfMode {
     ListeningPort(u16),
-    Capability(String)
+    Capability(String),
+    GetAck(String),
+    Ack(i64)
 }
 
 impl TryFrom<(&str, &str)> for ReplConfMode {
@@ -61,22 +63,32 @@ impl TryFrom<(&str, &str)> for ReplConfMode {
                 Ok(ReplConfMode::ListeningPort(port))
             },
             "capa" => Ok(ReplConfMode::Capability(value.1.to_string())),
+            "getack" => Ok(ReplConfMode::GetAck(value.1.to_string())),
+            "ack" => Ok(ReplConfMode::Ack(value.1.parse::<i64>()?)),
             mode => Err(anyhow!("info section {mode} not supported"))
         }
     }
 }
 
-impl Into<Vec<Resp>> for ReplConfMode {
-    fn into(self) -> Vec<Resp> {
-        match self {
-            Self::ListeningPort(port) => vec![
+impl From<ReplConfMode> for Vec<Resp> {
+    fn from(val: ReplConfMode) -> Self {
+        match val {
+            ReplConfMode::ListeningPort(port) => vec![
                 Resp::BulkString("LISTENING-PORT".to_string()),
                 Resp::BulkString(port.to_string())
             ],
-            Self::Capability(capa) => vec![
+            ReplConfMode::Capability(capa) => vec![
                 Resp::BulkString("CAPA".to_string()),
                 Resp::BulkString(capa)
-            ]
+            ],
+            ReplConfMode::GetAck(ack) => vec![
+                Resp::BulkString("GETACK".to_string()),
+                Resp::BulkString(ack)
+            ],
+            ReplConfMode::Ack(offset) => vec![
+                Resp::BulkString("ACK".to_string()),
+                Resp::BulkString(offset.to_string())
+            ],
         }
     }
 }
@@ -148,9 +160,9 @@ impl TryFrom<Resp> for RedisCommands {
     }
 }
 
-impl Into<Resp> for RedisCommands {
-    fn into(self) -> Resp {
-        match self {
+impl From<RedisCommands> for Resp {
+    fn from(val: RedisCommands) -> Self {
+        match val {
             RedisCommands::Echo(text) => Resp::Array(vec![
                 Resp::BulkString("ECHO".to_string()),
                 Resp::BulkString(text)
