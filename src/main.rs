@@ -1,5 +1,5 @@
 use std::{
-    io::{Write, BufReader, BufRead},
+    io::{Write, BufReader, BufRead, Read},
     net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex, mpsc::{channel, Receiver, Sender}}, time::{SystemTime, Duration}, env, num::ParseIntError
 };
 use anyhow::{anyhow, Context};
@@ -312,12 +312,9 @@ fn handle_command(command: &RedisCommands, stream: &mut impl Write, redis_map: &
                 .insert(options.key.to_string(), Value { value: options.value.to_string(), expire: options.expire, timestamp: SystemTime::now() });
             match server_info.lock().unwrap().server_type {
                 ServerType::Master(ref mut master_status) => {
+                    let set_command = Resp::from(command.clone());
+                    master_status.repl_offset += set_command.encode_to_bytes().len() as u64;
                     for repl_stream in &mut master_status.repl_tcp_streams {
-                        let set_command = Resp::Array(vec![
-                            Resp::BulkString("SET".to_string()),
-                            Resp::BulkString(options.key.to_string()),
-                            Resp::BulkString(options.value.to_string()),
-                        ]);
                         repl_stream.write_all(&set_command.encode_to_bytes())?;
                     }
                 },
@@ -371,12 +368,45 @@ fn handle_command(command: &RedisCommands, stream: &mut impl Write, redis_map: &
                 _ => unimplemented!()
             }
         },
-        RedisCommands::Wait(_, _) => {
-            match server_info.lock().unwrap().server_type {
+        RedisCommands::Wait(num_replicas, timeout) => {
+            let (mut replica_streams, master_offset) = match server_info.lock().unwrap().server_type {
                 ServerType::Master(ref master_status) => {
-                    Resp::Integer(master_status.repl_tcp_streams.len() as i64)
+                    let mut streams = vec![];
+                    for stream in &master_status.repl_tcp_streams {
+                        streams.push(stream.try_clone()?)
+                    }
+                    (streams, master_status.repl_offset)
                 },
-                ServerType::Replica(_) => unimplemented!(),
+                ServerType::Replica(_) => (vec![], 0),
+            };
+            let (tx, rx) = channel::<i32>();
+            let num_replicas = *num_replicas;
+            thread::spawn(move || {
+                loop {
+                    let mut replica_oks = 0;
+                    for stream in replica_streams.as_mut_slice() {
+                        let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
+                        if stream.write_all(&Resp::from(getack_command).encode_to_bytes()).is_ok() {
+                            let mut buf = [0u8, 128];
+                            let _ = stream.read(&mut buf);
+                            let (_, tokens) = tokenize_bytes(&buf).unwrap_or((&[0u8, 0], Resp::Empty));
+                            let command: RedisCommands = tokens.try_into().unwrap_or(RedisCommands::Ping);
+                            if let RedisCommands::ReplConf(commands::ReplConfMode::Ack(offset)) = command {
+                                if offset >= master_offset as i64 {
+                                    replica_oks += 1;
+                                }
+                            }
+                        }
+                    }
+                    if replica_oks >= num_replicas {
+                        let _ = tx.send(replica_oks);
+                    }
+                }
+            });
+
+            match rx.recv_timeout(Duration::from_millis(*timeout)) {
+                Ok(replica_oks) => Resp::Integer(replica_oks as i64),
+                Err(_) => Resp::Integer(0)
             }
         }
     };
