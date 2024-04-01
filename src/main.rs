@@ -1,6 +1,6 @@
 use std::{
-    io::{Read, Write},
-    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex, mpsc::{channel, Receiver, Sender}}, time::{SystemTime, Duration}, env, num::ParseIntError,
+    io::{Write, BufReader, BufRead},
+    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex, mpsc::{channel, Receiver, Sender}}, time::{SystemTime, Duration}, env, num::ParseIntError
 };
 use anyhow::{anyhow, Context};
 
@@ -138,14 +138,16 @@ fn main() -> anyhow::Result<()>{
 
 fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(format!("{}:{}", replica_info.master_address, replica_info.master_port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut buf_reader = BufReader::new(stream.try_clone()?);
+
     let ping_message = Resp::Array(vec![Resp::BulkString("ping".to_string())]);
     stream.write_all(ping_message.encode_to_string().as_bytes())?;
     println!("replica sent ping message");
 
-    let mut bytes = [0u8; 512];
-    let _ = stream.read(&mut bytes)?;
-    let (_, tokens) = tokenize_bytes(&bytes)?;
+    let bytes = buf_reader.fill_buf()?;
+    let (remainder, tokens) = tokenize_bytes(bytes)?;
+    let consumed_bytes = bytes.len() - remainder.len();
+    buf_reader.consume(consumed_bytes);
     println!("replica handshake received: {:?}", tokens);
     if !tokens.eq(&Resp::SimpleString("PONG".to_string())) {
         return Err(anyhow!("wrong response from master"))
@@ -159,9 +161,10 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     stream.write_all(replconf.encode_to_string().as_bytes())?;
     println!("replica sent first replconf message");
 
-    let mut bytes = [0u8; 512];
-    let _ = stream.read(&mut bytes)?;
-    let (_, tokens) = tokenize_bytes(&bytes)?;
+    let bytes = buf_reader.fill_buf()?;
+    let (remainder, tokens) = tokenize_bytes(bytes)?;
+    let consumed_bytes = bytes.len() - remainder.len();
+    buf_reader.consume(consumed_bytes);
     println!("replica handshake received: {:?}", tokens);
     if !tokens.eq(&Resp::SimpleString("OK".to_string())) {
         return Err(anyhow!("wrong response from master"))
@@ -175,9 +178,10 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     stream.write_all(replconf.encode_to_string().as_bytes())?;
     println!("replica sent second replconf message");
 
-    let mut bytes = [0u8; 512];
-    let _ = stream.read(&mut bytes)?;
-    let (_, tokens) = tokenize_bytes(&bytes)?;
+    let bytes = buf_reader.fill_buf()?;
+    let (remainder, tokens) = tokenize_bytes(bytes)?;
+    let consumed_bytes = bytes.len() - remainder.len();
+    buf_reader.consume(consumed_bytes);
     println!("replica handshake received: {:?}", tokens);
     if !tokens.eq(&Resp::SimpleString("OK".to_string())) {
         return Err(anyhow!("wrong response from master"))
@@ -191,34 +195,43 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     stream.write_all(psync.encode_to_string().as_bytes())?;
     println!("replica sent psync message");
 
-    let mut bytes = [0u8; 512];
-    let _ = stream.read(&mut bytes)?;
-    let (rdb_bytes, tokens) = tokenize_bytes(&bytes)?;
+    let bytes = buf_reader.fill_buf()?;
+    let (remainder, tokens) = tokenize_bytes(bytes)?;
+    let consumed_bytes = bytes.len() - remainder.len();
+    buf_reader.consume(consumed_bytes);
     println!("replica handshake received: {:?}", tokens);
-    let (remainder, rdb_len_line) = read_next_line(rdb_bytes)?;
-    let len = String::from_utf8(rdb_len_line[1..].to_vec())?.parse::<usize>()?;
-    let mut remainder = remainder.get(len..).ok_or(anyhow!("RDB bytes not found"))?;
-    while remainder.first() != Some(&0u8) {
-        let (new_remainder, tokens) = tokenize_bytes(remainder)?;
-        println!("replica received from master: {:?}", tokens);
-        let command: RedisCommands = tokens.try_into()?;
-        handle_master_command(&command, &mut stream, &redis_map)?;
-        remainder = new_remainder;
+    if !matches!(tokens, Resp::SimpleString(text) if text.starts_with("FULLRESYNC")) {
+        return Err(anyhow!("wrong response from master"));
     }
-    println!("replica rdb bytes read");
 
-    stream.set_read_timeout(None)?;
+    // Read RDB bytes
+    let bytes = buf_reader.fill_buf()?;
+    let (remainder, rdb_len_line) = read_next_line(bytes)?;
+    let consumed_bytes = bytes.len() - remainder.len();
+    let rdb_bytes_len = String::from_utf8(rdb_len_line[1..].to_vec())?.parse::<usize>()?;
+    buf_reader.consume(consumed_bytes);
+    buf_reader.consume(rdb_bytes_len);
+ 
     loop {
-        let mut bytes = [0u8; 512];
-        let bytes_read = stream.read(&mut bytes)?;
-        if bytes_read == 0 {
+        let bytes = buf_reader.fill_buf()?;
+        if bytes.is_empty() {
             return Ok(());
         }
 
-        let (_, tokens) = tokenize_bytes(&bytes)?;
-        println!("replica received from master: {:?}", tokens);
-        let command: RedisCommands = tokens.try_into()?;
-        handle_master_command(&command, &mut stream, &redis_map)?;
+        let remainder = match tokenize_bytes(bytes) {
+            Ok((remainder, tokens)) => {
+                println!("received: {:?}", tokens);
+                let command: RedisCommands = tokens.try_into()?;
+                handle_master_command(&command, &mut stream, &redis_map)?;
+                remainder
+            },
+            Err(err) => {
+                println!("skip buffer since untokenizable: {}", err);
+                bytes
+            }
+        };
+        let consumed_bytes = bytes.len() - remainder.len();
+        buf_reader.consume(consumed_bytes);
     }
 }
 
@@ -254,28 +267,38 @@ fn handle_propagate_commands(repl_prop_rx: Receiver<RedisCommands>, replica_info
 }
 
 fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_opts: Arc<Mutex<ServerStatus>>, repl_prop_tx: Sender<RedisCommands>) -> anyhow::Result<()> {
+    let mut buf_reader = BufReader::new(stream.try_clone()?);
     loop {
-        let mut bytes = [0u8; 512];
-        let bytes_read = stream.read(&mut bytes)?;
-        if bytes_read == 0 {
+        let bytes = buf_reader.fill_buf()?;
+        if bytes.is_empty() {
             return Ok(());
         }
 
-        let (_, tokens) = tokenize_bytes(&bytes)?;
-        println!("received: {:?}", tokens);
-        let command: RedisCommands = tokens.try_into()?;
-        handle_command(&command, &mut stream, &redis_map, &server_opts, &repl_prop_tx)?;
-        if let RedisCommands::PSync(_, _) = command {
-            if let ServerType::Master(ref mut master_status) = server_opts.lock().unwrap().server_type {
-                master_status.repl_tcp_streams.push(stream);
-                println!("master added a replica");
-                return Ok(());
+        let remainder = match tokenize_bytes(bytes) {
+            Ok((remainder, tokens)) => {
+                println!("received: {:?}", tokens);
+                let command: RedisCommands = tokens.try_into()?;
+                handle_command(&command, &mut stream, &redis_map, &server_opts, &repl_prop_tx)?;
+                if let RedisCommands::PSync(_, _) = command {
+                    if let ServerType::Master(ref mut master_status) = server_opts.lock().unwrap().server_type {
+                        master_status.repl_tcp_streams.push(stream);
+                        println!("master added a replica");
+                        return Ok(());
+                    }
+                }
+                remainder
+            },
+            Err(err) => {
+                println!("skip buffer since untokenizable: {}", err);
+                bytes
             }
-        }
+        };
+        let consumed_bytes = bytes.len() - remainder.len();
+        buf_reader.consume(consumed_bytes);
     }
 }
 
-fn handle_command(command: &RedisCommands, stream: &mut TcpStream, redis_map: &Arc<Mutex<HashMap<String, Value>>>, server_info: &Arc<Mutex<ServerStatus>>, repl_prop_tx: &Sender<RedisCommands>) -> anyhow::Result<()> {
+fn handle_command(command: &RedisCommands, stream: &mut impl Write, redis_map: &Arc<Mutex<HashMap<String, Value>>>, server_info: &Arc<Mutex<ServerStatus>>, repl_prop_tx: &Sender<RedisCommands>) -> anyhow::Result<()> {
     let response = match command {
         RedisCommands::Echo(text) => Resp::SimpleString(text.to_string()),
         RedisCommands::Ping => Resp::SimpleString("PONG".to_string()),
