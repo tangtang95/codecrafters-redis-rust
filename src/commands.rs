@@ -156,6 +156,13 @@ impl TryFrom<Resp> for RedisCommands {
                 let repl_offset = repl_offset.parse::<i64>()?;
                 Ok(RedisCommands::PSync(repl_id.to_string(), repl_offset))
             },
+            "wait" => {
+                let Some(Resp::BulkString(num_replicas)) = array.get(1) else { return Err(anyhow!("Wait num_replicas missing")) };
+                let Some(Resp::BulkString(timeout)) = array.get(2) else { return Err(anyhow!("Wait timeout missing")) };
+                let num_replicas = num_replicas.parse::<i32>()?;
+                let timeout = timeout.parse::<u64>()?;
+                Ok(RedisCommands::Wait(num_replicas, timeout))
+            },
             _ => unimplemented!()
         }
     }
