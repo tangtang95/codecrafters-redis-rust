@@ -4,7 +4,7 @@ use std::{
 };
 use anyhow::{anyhow, Context};
 
-use crate::{tokenizer::{Resp, tokenize_bytes}, commands::{RedisCommands, InfoSection}};
+use crate::{tokenizer::{Resp, tokenize_bytes, read_next_line}, commands::{RedisCommands, InfoSection}};
 
 mod tokenizer;
 mod commands;
@@ -193,8 +193,15 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
 
     let mut bytes = [0u8; 512];
     let _ = stream.read(&mut bytes)?;
-    let (_, tokens) = tokenize_bytes(&bytes)?;
+    println!("bytes {:?}", bytes);
+    let (rdb_bytes, tokens) = tokenize_bytes(&bytes)?;
     println!("replica handshake received: {:?}", tokens);
+    println!("rdb bytes {:?}", rdb_bytes);
+    if rdb_bytes.first() == Some(&0u8) {
+        let mut rdb_bytes = [0u8; 512];
+        let _ = stream.read(&mut rdb_bytes)?;
+        println!("rdb bytes {:?}", rdb_bytes);
+    }
 
     stream.set_read_timeout(None)?;
     loop {
