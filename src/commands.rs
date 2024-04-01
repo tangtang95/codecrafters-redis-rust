@@ -10,7 +10,8 @@ pub enum RedisCommands {
     Get(String),
     Info(Option<InfoSection>),
     ReplConf(ReplConfMode),
-    PSync(String, i64)
+    PSync(String, i64),
+    Wait(i32, u64)
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +209,11 @@ impl From<RedisCommands> for Resp {
                 Resp::BulkString(repl_id),
                 Resp::BulkString(repl_offset.to_string()),
             ]),
+            RedisCommands::Wait(num_replicas, timeout) => Resp::Array(vec![
+                Resp::BulkString("WAIT".to_string()),
+                Resp::BulkString(num_replicas.to_string()),
+                Resp::BulkString(timeout.to_string()),
+            ])
         }
     }
 }

@@ -370,6 +370,9 @@ fn handle_command(command: &RedisCommands, stream: &mut impl Write, redis_map: &
                 },
                 _ => unimplemented!()
             }
+        },
+        RedisCommands::Wait(_, _) => {
+            Resp::SimpleString("0".to_string())
         }
     };
     stream.write_all(response.encode_to_string().as_bytes())?;
