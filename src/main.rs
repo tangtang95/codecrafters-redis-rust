@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex}, time::{SystemTime, Duration}, env, num::ParseIntError,
+    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex, mpsc::{channel, Receiver, Sender}}, time::{SystemTime, Duration}, env, num::ParseIntError,
 };
 use anyhow::{anyhow, Context};
 
@@ -87,12 +87,20 @@ fn main() -> anyhow::Result<()>{
         })
     };
 
+    let (repl_prop_tx, repl_prop_rx) = channel::<RedisCommands>();
     if let ServerType::Replica(replica_status) = &server_type {
         let replica_info = ReplicaStatus { master_address: replica_status.master_address.clone(), master_port: replica_status.master_port };
         let redis_map = redis_map.clone();
         thread::spawn(move || {
             match connect_master(replica_info, server_opts.port, redis_map) {
                 Ok(_) => println!("connection with master handled correctly"),
+                Err(err) => println!("{}", err),
+            }
+        });
+        let replica_info = ReplicaStatus { master_address: replica_status.master_address.clone(), master_port: replica_status.master_port };
+        thread::spawn(move || {
+            match handle_propagate_commands(repl_prop_rx, replica_info) {
+                Ok(_) => println!("exit from handle propagation commands correctly"),
                 Err(err) => println!("{}", err),
             }
         });
@@ -109,10 +117,11 @@ fn main() -> anyhow::Result<()>{
                 let _socket_id = socket_id;
                 let redis_map = redis_map.clone();
                 let server_opts = server_opts.clone();
+                let repl_prop_tx = repl_prop_tx.clone();
 
                 println!("accepted new connection socket {}", _socket_id);
                 thread::spawn(move || {
-                    match handle_client(_stream, redis_map, server_opts) {
+                    match handle_client(_stream, redis_map, server_opts, repl_prop_tx) {
                         Ok(_) => println!("connection {} handled correctly", _socket_id),
                         Err(err) => println!("{}", err),
                     }
@@ -205,7 +214,21 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     }
 }
 
-fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_opts: Arc<Mutex<ServerStatus>>) -> anyhow::Result<()> {
+fn handle_propagate_commands(repl_prop_rx: Receiver<RedisCommands>, replica_info: ReplicaStatus) -> anyhow::Result<()> {
+    loop {
+        let command = repl_prop_rx.recv()?;
+        if let RedisCommands::Set(_) = command {
+            let set_cmd: Resp = command.into();
+            match TcpStream::connect(format!("{}:{}", replica_info.master_address, replica_info.master_port)) {
+                Ok(mut stream) => stream.write_all(&set_cmd.encode_to_bytes())?,
+                Err(err) => println!("handle propagation commands failed to connect to master: {}", err)
+            }
+            println!("set command {:?} propagated to master", set_cmd);
+        }
+    }
+}
+
+fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_opts: Arc<Mutex<ServerStatus>>, repl_prop_tx: Sender<RedisCommands>) -> anyhow::Result<()> {
     loop {
         let mut bytes = [0u8; 512];
         let bytes_read = stream.read(&mut bytes)?;
@@ -216,7 +239,7 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
         let (_, tokens) = tokenize_bytes(&bytes)?;
         println!("received: {:?}", tokens);
         let command: RedisCommands = tokens.try_into()?;
-        handle_command(&command, &mut stream, &redis_map, &server_opts)?;
+        handle_command(&command, &mut stream, &redis_map, &server_opts, &repl_prop_tx)?;
         if let RedisCommands::PSync(_, _) = command {
             if let ServerType::Master(ref mut master_status) = server_opts.lock().unwrap().server_type {
                 master_status.repl_tcp_streams.push(stream);
@@ -227,23 +250,27 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
     }
 }
 
-fn handle_command(command: &RedisCommands, stream: &mut TcpStream, redis_map: &Arc<Mutex<HashMap<String, Value>>>, server_info: &Arc<Mutex<ServerStatus>>) -> anyhow::Result<()> {
+fn handle_command(command: &RedisCommands, stream: &mut TcpStream, redis_map: &Arc<Mutex<HashMap<String, Value>>>, server_info: &Arc<Mutex<ServerStatus>>, repl_prop_tx: &Sender<RedisCommands>) -> anyhow::Result<()> {
     let response = match command {
         RedisCommands::Echo(text) => Resp::SimpleString(text.to_string()),
         RedisCommands::Ping => Resp::SimpleString("PONG".to_string()),
         RedisCommands::Set(options) => {
             redis_map.lock().unwrap()
                 .insert(options.key.to_string(), Value { value: options.value.to_string(), expire: options.expire, timestamp: SystemTime::now() });
-            if let ServerType::Master(ref mut master_status) = server_info.lock().unwrap().server_type {
-                for repl_stream in &mut master_status.repl_tcp_streams {
-                    let set_command = Resp::Array(vec![
-                        Resp::BulkString("SET".to_string()),
-                        Resp::BulkString(options.key.to_string()),
-                        Resp::BulkString(options.value.to_string()),
-                    ]);
-                    repl_stream.write_all(&set_command.encode_to_bytes())?;
-                }
-            }
+            match server_info.lock().unwrap().server_type {
+                ServerType::Master(ref mut master_status) => {
+                    for repl_stream in &mut master_status.repl_tcp_streams {
+                        let set_command = Resp::Array(vec![
+                            Resp::BulkString("SET".to_string()),
+                            Resp::BulkString(options.key.to_string()),
+                            Resp::BulkString(options.value.to_string()),
+                        ]);
+                        repl_stream.write_all(&set_command.encode_to_bytes())?;
+                    }
+                },
+                ServerType::Replica(_) => { repl_prop_tx.send(command.clone())?; },
+            };
+
             Resp::SimpleString("OK".to_string())
         },
         RedisCommands::Get(key) => {

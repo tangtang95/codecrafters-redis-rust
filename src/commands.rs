@@ -2,6 +2,7 @@ use anyhow::anyhow;
 
 use crate::tokenizer::Resp;
 
+#[derive(Clone)]
 pub enum RedisCommands {
     Echo(String),
     Ping,
@@ -12,12 +13,15 @@ pub enum RedisCommands {
     PSync(String, i64)
 }
 
+#[derive(Clone)]
 pub struct SetOptions {
     pub key: String,
     pub value: String,
     pub expire: Option<u64>
 }
 
+
+#[derive(Clone)]
 pub enum InfoSection {
     Replication
 }
@@ -33,6 +37,15 @@ impl TryFrom<&str> for InfoSection {
     }
 }
 
+impl Into<Resp> for InfoSection {
+    fn into(self) -> Resp {
+        match self {
+            Self::Replication => Resp::BulkString("REPLICATION".to_string()),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum ReplConfMode {
     ListeningPort(u16),
     Capability(String)
@@ -49,6 +62,21 @@ impl TryFrom<(&str, &str)> for ReplConfMode {
             },
             "capa" => Ok(ReplConfMode::Capability(value.1.to_string())),
             mode => Err(anyhow!("info section {mode} not supported"))
+        }
+    }
+}
+
+impl Into<Vec<Resp>> for ReplConfMode {
+    fn into(self) -> Vec<Resp> {
+        match self {
+            Self::ListeningPort(port) => vec![
+                Resp::BulkString("LISTENING-PORT".to_string()),
+                Resp::BulkString(port.to_string())
+            ],
+            Self::Capability(capa) => vec![
+                Resp::BulkString("CAPA".to_string()),
+                Resp::BulkString(capa)
+            ]
         }
     }
 }
@@ -116,6 +144,58 @@ impl TryFrom<Resp> for RedisCommands {
                 Ok(RedisCommands::PSync(repl_id.to_string(), repl_offset))
             },
             _ => unimplemented!()
+        }
+    }
+}
+
+impl Into<Resp> for RedisCommands {
+    fn into(self) -> Resp {
+        match self {
+            RedisCommands::Echo(text) => Resp::Array(vec![
+                Resp::BulkString("ECHO".to_string()),
+                Resp::BulkString(text)
+            ]),
+            RedisCommands::Ping => Resp::Array(vec![
+                Resp::BulkString("PING".to_string()),
+            ]),
+            RedisCommands::Set(opts) => {
+                let mut set_cmd = vec![
+                    Resp::BulkString("SET".to_string()),
+                    Resp::BulkString(opts.key),
+                    Resp::BulkString(opts.value),
+                ];
+                if let Some(expire) = opts.expire {
+                    set_cmd.push(Resp::BulkString("PX".to_string()));
+                    set_cmd.push(Resp::BulkString(expire.to_string()));
+                }
+                Resp::Array(set_cmd)
+            },
+            RedisCommands::Get(key) => Resp::Array(vec![
+                Resp::BulkString("GET".to_string()),
+                Resp::BulkString(key),
+            ]),
+            RedisCommands::Info(section) => {
+                let mut info_cmd = vec![
+                    Resp::BulkString("INFO".to_string()),
+                ];
+                if let Some(section) = section {
+                    info_cmd.push(section.into());
+                }
+                Resp::Array(info_cmd)
+            },
+            RedisCommands::ReplConf(mode) => {
+                let mut replconf_cmd = vec![
+                    Resp::BulkString("REPLCONF".to_string()), 
+                ];
+                let mode_resp: Vec<Resp> = mode.into();
+                replconf_cmd.extend(mode_resp);
+                Resp::Array(replconf_cmd)
+            },
+            RedisCommands::PSync(repl_id, repl_offset) => Resp::Array(vec![
+                Resp::BulkString("PSYNC".to_string()),
+                Resp::BulkString(repl_id),
+                Resp::BulkString(repl_offset.to_string()),
+            ]),
         }
     }
 }
