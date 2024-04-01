@@ -212,6 +212,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     buf_reader.consume(consumed_bytes);
     buf_reader.consume(rdb_bytes_len);
  
+    let mut ack_offset = 0i64;
     loop {
         let bytes = buf_reader.fill_buf()?;
         if bytes.is_empty() {
@@ -222,7 +223,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
             Ok((remainder, tokens)) => {
                 println!("received: {:?}", tokens);
                 let command: RedisCommands = tokens.try_into()?;
-                handle_master_command(&command, &mut stream, &redis_map)?;
+                handle_master_command(&command, &mut stream, &redis_map, ack_offset)?;
                 remainder
             },
             Err(err) => {
@@ -231,18 +232,22 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
             }
         };
         let consumed_bytes = bytes.len() - remainder.len();
+        ack_offset += consumed_bytes as i64;
         buf_reader.consume(consumed_bytes);
     }
 }
 
-fn handle_master_command(command: &RedisCommands, stream: &mut TcpStream, redis_map: &Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
+fn handle_master_command(command: &RedisCommands, stream: &mut TcpStream, redis_map: &Arc<Mutex<HashMap<String, Value>>>, ack_offset: i64) -> anyhow::Result<()> {
     match command {
+        RedisCommands::Ping => {
+            println!("replica received ping from master");
+        }
         RedisCommands::Set(opts) => {
             redis_map.lock().unwrap()
                 .insert(opts.key.to_string(), Value { value: opts.value.to_string(), expire: opts.expire, timestamp: SystemTime::now() });
         },
         RedisCommands::ReplConf(commands::ReplConfMode::GetAck(_)) => {
-            let response = RedisCommands::ReplConf(commands::ReplConfMode::Ack(0));
+            let response = RedisCommands::ReplConf(commands::ReplConfMode::Ack(ack_offset));
             stream.write_all(&Resp::from(response).encode_to_bytes())?;
         },
         _ => {
