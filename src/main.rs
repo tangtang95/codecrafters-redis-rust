@@ -193,14 +193,20 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
 
     let mut bytes = [0u8; 512];
     let _ = stream.read(&mut bytes)?;
-    println!("bytes {:?}", bytes);
     let (rdb_bytes, tokens) = tokenize_bytes(&bytes)?;
     println!("replica handshake received: {:?}", tokens);
-    println!("rdb bytes {:?}", rdb_bytes);
-    if rdb_bytes.first() == Some(&0u8) {
-        let mut rdb_bytes = [0u8; 512];
-        let _ = stream.read(&mut rdb_bytes)?;
-        println!("rdb bytes {:?}", rdb_bytes);
+    let (remainder, rdb_len_line) = read_next_line(rdb_bytes)?;
+    let len = String::from_utf8(rdb_len_line[1..].to_vec())?.parse::<usize>()?;
+    let mut remainder = remainder.get(len..).ok_or(anyhow!("RDB bytes not found"))?;
+    while remainder.first() != Some(&0u8) {
+        let (new_remainder, tokens) = tokenize_bytes(remainder)?;
+        println!("replica received from master: {:?}", tokens);
+        let command: RedisCommands = tokens.try_into()?;
+        if let RedisCommands::Set(opts) = command {
+            redis_map.lock().unwrap()
+                .insert(opts.key.to_string(), Value { value: opts.value.to_string(), expire: opts.expire, timestamp: SystemTime::now() });
+        }
+        remainder = new_remainder;
     }
 
     stream.set_read_timeout(None)?;
@@ -212,7 +218,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
         }
 
         let (_, tokens) = tokenize_bytes(&bytes)?;
-        println!("replica received: {:?}", tokens);
+        println!("replica received from master: {:?}", tokens);
         let command: RedisCommands = tokens.try_into()?;
         if let RedisCommands::Set(opts) = command {
             redis_map.lock().unwrap()
