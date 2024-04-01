@@ -372,7 +372,12 @@ fn handle_command(command: &RedisCommands, stream: &mut impl Write, redis_map: &
             }
         },
         RedisCommands::Wait(_, _) => {
-            Resp::Integer(0)
+            match server_info.lock().unwrap().server_type {
+                ServerType::Master(ref master_status) => {
+                    Resp::Integer(master_status.repl_tcp_streams.len() as i64)
+                },
+                ServerType::Replica(_) => unimplemented!(),
+            }
         }
     };
     stream.write_all(response.encode_to_string().as_bytes())?;
