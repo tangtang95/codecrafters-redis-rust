@@ -202,12 +202,10 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
         let (new_remainder, tokens) = tokenize_bytes(remainder)?;
         println!("replica received from master: {:?}", tokens);
         let command: RedisCommands = tokens.try_into()?;
-        if let RedisCommands::Set(opts) = command {
-            redis_map.lock().unwrap()
-                .insert(opts.key.to_string(), Value { value: opts.value.to_string(), expire: opts.expire, timestamp: SystemTime::now() });
-        }
+        handle_master_command(&command, &mut stream, &redis_map)?;
         remainder = new_remainder;
     }
+    println!("replica rdb bytes read");
 
     stream.set_read_timeout(None)?;
     loop {
@@ -220,20 +218,25 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
         let (_, tokens) = tokenize_bytes(&bytes)?;
         println!("replica received from master: {:?}", tokens);
         let command: RedisCommands = tokens.try_into()?;
-        match command {
-            RedisCommands::Set(opts) => {
-                redis_map.lock().unwrap()
-                    .insert(opts.key.to_string(), Value { value: opts.value.to_string(), expire: opts.expire, timestamp: SystemTime::now() });
-            },
-            RedisCommands::ReplConf(commands::ReplConfMode::GetAck(_)) => {
-                let response = RedisCommands::ReplConf(commands::ReplConfMode::Ack(0));
-                stream.write_all(&Resp::from(response).encode_to_bytes())?;
-            },
-            _ => {
-                println!("replica ignore command from master: {:?}", command);
-            }
-        }
+        handle_master_command(&command, &mut stream, &redis_map)?;
     }
+}
+
+fn handle_master_command(command: &RedisCommands, stream: &mut TcpStream, redis_map: &Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
+    match command {
+        RedisCommands::Set(opts) => {
+            redis_map.lock().unwrap()
+                .insert(opts.key.to_string(), Value { value: opts.value.to_string(), expire: opts.expire, timestamp: SystemTime::now() });
+        },
+        RedisCommands::ReplConf(commands::ReplConfMode::GetAck(_)) => {
+            let response = RedisCommands::ReplConf(commands::ReplConfMode::Ack(0));
+            stream.write_all(&Resp::from(response).encode_to_bytes())?;
+        },
+        _ => {
+            println!("replica ignore command from master: {:?}", command);
+        }
+    };
+    Ok(())
 }
 
 fn handle_propagate_commands(repl_prop_rx: Receiver<RedisCommands>, replica_info: ReplicaStatus) -> anyhow::Result<()> {
