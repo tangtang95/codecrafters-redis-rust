@@ -462,6 +462,11 @@ fn handle_command(
                         let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
                         loop {
                             let bytes = buf_reader.fill_buf().unwrap();
+
+                            if bytes.is_empty() {
+                                replica_oks += 1;
+                                break;
+                            }
                             let remainder = match tokenize_bytes(bytes) {
                                 Ok((remainder, tokens)) => {
                                     println!("received: {:?}", tokens);
