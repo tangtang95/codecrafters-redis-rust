@@ -432,6 +432,7 @@ fn handle_command(
             _ => unimplemented!(),
         },
         RedisCommands::Wait(num_replicas, timeout) => {
+            let start_time = SystemTime::now();
             let (mut replica_streams, master_offset) = match server_info.lock().unwrap().server_type {
                 ServerType::Master(ref master_status) => {
                     let mut streams = vec![];
@@ -442,7 +443,7 @@ fn handle_command(
                 }
                 ServerType::Replica(_) => (vec![], 0),
             };
-            let (tx, rx) = channel::<i32>();
+            let (tx, rx) = channel::<(bool, i32)>();
             let num_replicas = *num_replicas;
             thread::spawn(move || loop {
                 let mut replica_oks = 0;
@@ -460,15 +461,27 @@ fn handle_command(
                         }
                     }
                 }
-                if replica_oks >= num_replicas {
-                    let _ = tx.send(replica_oks);
-                }
+                let _ = tx.send(( replica_oks >= num_replicas, replica_oks ));
             });
 
-            match rx.recv_timeout(Duration::from_millis(*timeout)) {
-                Ok(replica_oks) => Resp::Integer(replica_oks as i64),
-                Err(_) => Resp::Integer(0),
-            }
+            let mut last_replica_oks = 0;
+            let replica_oks = loop {
+                let remaining_time = Duration::from_millis(*timeout) - SystemTime::now().duration_since(start_time)?;
+                if remaining_time > Duration::ZERO {
+                    match rx.recv_timeout(remaining_time) {
+                        Ok((done, replica_oks)) => {
+                            last_replica_oks = replica_oks;
+                            if done {
+                                break replica_oks;
+                            }
+                        },
+                        Err(_) => break last_replica_oks,
+                    };
+                } else {
+                    break last_replica_oks;
+                }
+            };
+            Resp::Integer(replica_oks as i64)
         }
     };
     stream.write_all(response.encode_to_string().as_bytes())?;
