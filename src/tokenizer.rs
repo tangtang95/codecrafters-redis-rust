@@ -1,3 +1,5 @@
+use std::backtrace::Backtrace;
+
 use anyhow::anyhow;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -88,7 +90,8 @@ pub fn tokenize_bytes(buffer: &[u8]) -> anyhow::Result<(&[u8], Resp)> {
             Ok((remainder, Resp::SimpleString(text.to_string())))
         }
         _ => {
-            println!("RESP type `{}` not implemented", char::from(*value_type));
+            println!("RESP type `{}` not implemented", value_type);
+            println!("Custom backtrace: {}", Backtrace::force_capture());
             unimplemented!()
         }
     }

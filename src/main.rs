@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context};
 use std::{
     collections::HashMap,
     env,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     num::ParseIntError,
     sync::{
@@ -46,6 +46,7 @@ enum ServerType {
 struct MasterStatus {
     repl_id: String,
     repl_offset: u64,
+    repl_data_offset: u64,
     repl_tcp_streams: Vec<TcpStream>,
 }
 
@@ -104,6 +105,7 @@ fn main() -> anyhow::Result<()> {
         None => ServerType::Master(MasterStatus {
             repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
             repl_offset: 0,
+            repl_data_offset: 0,
             repl_tcp_streams: Vec::new(),
         }),
     };
@@ -227,10 +229,13 @@ fn connect_master(
     let consumed_bytes = bytes.len() - remainder.len();
     buf_reader.consume(consumed_bytes);
     println!("replica handshake received: {:?}", tokens);
-    if !matches!(tokens, Resp::SimpleString(text) if text.starts_with("FULLRESYNC")) {
-        return Err(anyhow!("wrong response from master"));
-    }
-
+    let mut ack_offset = match tokens {
+        Resp::SimpleString(resync_text) if resync_text.starts_with("FULLRESYNC") => {
+            let split_text: Vec<&str> = resync_text.split_ascii_whitespace().collect();
+            split_text.get(2).unwrap_or(&"0").parse::<i64>()?
+        },
+        _ => return Err(anyhow!("wrong response from master"))
+    };
     // Read RDB bytes
     let bytes = buf_reader.fill_buf()?;
     let (remainder, rdb_len_line) = read_next_line(bytes)?;
@@ -239,7 +244,6 @@ fn connect_master(
     buf_reader.consume(consumed_bytes);
     buf_reader.consume(rdb_bytes_len);
 
-    let mut ack_offset = 0i64;
     loop {
         let bytes = buf_reader.fill_buf()?;
         if bytes.is_empty() {
@@ -369,6 +373,7 @@ fn handle_command(
                 ServerType::Master(ref mut master_status) => {
                     let set_command = Resp::from(command.clone());
                     master_status.repl_offset += set_command.encode_to_bytes().len() as u64;
+                    master_status.repl_data_offset = master_status.repl_offset;
                     for repl_stream in &mut master_status.repl_tcp_streams {
                         repl_stream.write_all(&set_command.encode_to_bytes())?;
                     }
@@ -433,42 +438,68 @@ fn handle_command(
         },
         RedisCommands::Wait(num_replicas, timeout) => {
             let start_time = SystemTime::now();
-            let (mut replica_streams, master_offset) = match server_info.lock().unwrap().server_type {
+            let (mut replica_streams, master_data_offset) = match server_info.lock().unwrap().server_type {
                 ServerType::Master(ref master_status) => {
                     let mut streams = vec![];
                     for stream in &master_status.repl_tcp_streams {
                         streams.push(stream.try_clone()?)
                     }
-                    (streams, master_status.repl_offset)
+                    (streams, master_status.repl_data_offset)
                 }
                 ServerType::Replica(_) => (vec![], 0),
             };
+            println!("[wait]: master_offset: {}", master_data_offset);
             let (tx, rx) = channel::<(bool, i32)>();
             let num_replicas = *num_replicas;
+            let start_time_clone = start_time;
+            let timeout_clone = *timeout;
+            let server_info = server_info.clone();
             thread::spawn(move || loop {
                 let mut replica_oks = 0;
                 for stream in replica_streams.as_mut_slice() {
                     let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
                     if stream.write_all(&Resp::from(getack_command).encode_to_bytes()).is_ok() {
-                        let mut buf = [0u8, 128];
-                        let _ = stream.read(&mut buf);
-                        let (_, tokens) = tokenize_bytes(&buf).unwrap_or((&[0u8, 0], Resp::Empty));
-                        let command: RedisCommands = tokens.try_into().unwrap_or(RedisCommands::Ping);
-                        if let RedisCommands::ReplConf(commands::ReplConfMode::Ack(offset)) = command {
-                            if offset >= master_offset as i64 {
-                                replica_oks += 1;
-                            }
+                        let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
+                        loop {
+                            let bytes = buf_reader.fill_buf().unwrap();
+                            let remainder = match tokenize_bytes(bytes) {
+                                Ok((remainder, tokens)) => {
+                                    println!("received: {:?}", tokens);
+                                    let command: RedisCommands = tokens.try_into().unwrap();
+                                    if let RedisCommands::ReplConf(commands::ReplConfMode::Ack(offset)) = command {
+                                        if offset >= master_data_offset as i64 {
+                                            replica_oks += 1;
+                                            break;
+                                        }
+                                    }
+                                    remainder
+                                }
+                                Err(err) => {
+                                    println!("skip buffer since untokenizable: {}", err);
+                                    bytes
+                                }
+                            };
+                            let consumed_bytes = bytes.len() - remainder.len();
+                            buf_reader.consume(consumed_bytes);
                         }
                     }
                 }
+                if let ServerType::Master(master_status) = &mut server_info.lock().unwrap().server_type {
+                    let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
+                    let getack_resp = Resp::from(getack_command.clone());
+                    master_status.repl_offset += getack_resp.encode_to_bytes().len() as u64;
+                };
                 let _ = tx.send(( replica_oks >= num_replicas, replica_oks ));
+                if Duration::from_millis(timeout_clone) < SystemTime::now().duration_since(start_time_clone).unwrap() || replica_oks >= num_replicas {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
             });
 
             let mut last_replica_oks = 0;
             let replica_oks = loop {
-                let remaining_time = Duration::from_millis(*timeout) - SystemTime::now().duration_since(start_time)?;
-                if remaining_time > Duration::ZERO {
-                    match rx.recv_timeout(remaining_time) {
+                if Duration::from_millis(*timeout) > SystemTime::now().duration_since(start_time)? {
+                    match rx.recv_timeout(Duration::from_millis(*timeout) - SystemTime::now().duration_since(start_time)?)  {
                         Ok((done, replica_oks)) => {
                             last_replica_oks = replica_oks;
                             if done {
