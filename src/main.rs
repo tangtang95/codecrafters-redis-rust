@@ -1,25 +1,37 @@
-use std::{
-    io::{Write, BufReader, BufRead, Read},
-    net::{TcpListener, TcpStream}, thread, collections::HashMap, sync::{Arc, Mutex, mpsc::{channel, Receiver, Sender}}, time::{SystemTime, Duration}, env, num::ParseIntError
-};
 use anyhow::{anyhow, Context};
+use std::{
+    collections::HashMap,
+    env,
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    num::ParseIntError,
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, SystemTime},
+};
 
-use crate::{tokenizer::{Resp, tokenize_bytes, read_next_line}, commands::{RedisCommands, InfoSection}};
+use crate::{
+    commands::{InfoSection, RedisCommands},
+    tokenizer::{read_next_line, tokenize_bytes, Resp},
+};
 
-mod tokenizer;
 mod commands;
+mod tokenizer;
 
 const EMPTY_RDB: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
 struct Value {
     value: String,
     expire: Option<u64>,
-    timestamp: SystemTime
+    timestamp: SystemTime,
 }
 
 struct ServerOptions {
     port: u16,
-    replicaof: Option<(String, u16)>
+    replicaof: Option<(String, u16)>,
 }
 
 struct ServerStatus {
@@ -28,50 +40,56 @@ struct ServerStatus {
 
 enum ServerType {
     Master(MasterStatus),
-    Replica(ReplicaStatus)
+    Replica(ReplicaStatus),
 }
 
 struct MasterStatus {
     repl_id: String,
     repl_offset: u64,
-    repl_tcp_streams: Vec<TcpStream>
+    repl_tcp_streams: Vec<TcpStream>,
 }
 
 struct ReplicaStatus {
     master_address: String,
-    master_port: u16
+    master_port: u16,
 }
 
 impl ServerType {
     fn encode_to_info_string(&self) -> String {
         match self {
-            ServerType::Master(status) => 
-                format!("role:master\r\n\
+            ServerType::Master(status) => format!(
+                "role:master\r\n\
                     master_replid:{}\r\n\
-                    master_repl_offset:{}", 
-                    status.repl_id, status.repl_offset
-                ),
-            ServerType::Replica(_) => 
-                "role:slave".to_string(),
+                    master_repl_offset:{}",
+                status.repl_id, status.repl_offset
+            ),
+            ServerType::Replica(_) => "role:slave".to_string(),
         }
     }
 }
 
-fn main() -> anyhow::Result<()>{
+fn main() -> anyhow::Result<()> {
     let mut args = env::args();
-    let mut server_opts = ServerOptions { port: 6379, replicaof: None };
+    let mut server_opts = ServerOptions {
+        port: 6379,
+        replicaof: None,
+    };
     let _ = args.next();
     while let Some(arg) = args.next() {
         if arg.eq("--port") {
             let port_text = args.next().ok_or(anyhow!("port arg not found"))?;
-            server_opts.port = port_text.parse::<u16>().with_context(|| "port is not a number between 0 and 65536")?;
+            server_opts.port = port_text
+                .parse::<u16>()
+                .with_context(|| "port is not a number between 0 and 65536")?;
         } else if arg.eq("--replicaof") {
             let master_host = args.next().ok_or(anyhow!("replicaof master host not found"))?;
             let master_port = args.next().ok_or(anyhow!("replicaof master pord not found"))?;
-            let master_port = master_port.parse::<u16>().with_context(|| "master port is not a number between 0 and 65536")?;
+            let master_port = master_port
+                .parse::<u16>()
+                .with_context(|| "master port is not a number between 0 and 65536")?;
             server_opts.replicaof = Some((master_host, master_port));
         } else {
-            return Err(anyhow!("invalid cli arg \"{arg}\""))
+            return Err(anyhow!("invalid cli arg \"{arg}\""));
         }
     }
     let listener = TcpListener::bind(format!("127.0.0.1:{}", server_opts.port))?;
@@ -79,36 +97,41 @@ fn main() -> anyhow::Result<()>{
 
     let redis_map = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
     let server_type = match server_opts.replicaof {
-        Some((master_address, master_port)) => ServerType::Replica(ReplicaStatus { master_address, master_port }),
-        None => ServerType::Master(MasterStatus { 
+        Some((master_address, master_port)) => ServerType::Replica(ReplicaStatus {
+            master_address,
+            master_port,
+        }),
+        None => ServerType::Master(MasterStatus {
             repl_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
             repl_offset: 0,
-            repl_tcp_streams: Vec::new() 
-        })
+            repl_tcp_streams: Vec::new(),
+        }),
     };
 
     let (repl_prop_tx, repl_prop_rx) = channel::<RedisCommands>();
     if let ServerType::Replica(replica_status) = &server_type {
-        let replica_info = ReplicaStatus { master_address: replica_status.master_address.clone(), master_port: replica_status.master_port };
+        let replica_info = ReplicaStatus {
+            master_address: replica_status.master_address.clone(),
+            master_port: replica_status.master_port,
+        };
         let redis_map = redis_map.clone();
-        thread::spawn(move || {
-            match connect_master(replica_info, server_opts.port, redis_map) {
+        thread::spawn(
+            move || match connect_master(replica_info, server_opts.port, redis_map) {
                 Ok(_) => println!("connection with master handled correctly"),
                 Err(err) => println!("{}", err),
-            }
-        });
-        let replica_info = ReplicaStatus { master_address: replica_status.master_address.clone(), master_port: replica_status.master_port };
-        thread::spawn(move || {
-            match handle_propagate_commands(repl_prop_rx, replica_info) {
-                Ok(_) => println!("exit from handle propagation commands correctly"),
-                Err(err) => println!("{}", err),
-            }
+            },
+        );
+        let replica_info = ReplicaStatus {
+            master_address: replica_status.master_address.clone(),
+            master_port: replica_status.master_port,
+        };
+        thread::spawn(move || match handle_propagate_commands(repl_prop_rx, replica_info) {
+            Ok(_) => println!("exit from handle propagation commands correctly"),
+            Err(err) => println!("{}", err),
         });
     }
 
-    let server_opts = Arc::new(Mutex::new(ServerStatus {
-        server_type
-    }));
+    let server_opts = Arc::new(Mutex::new(ServerStatus { server_type }));
 
     let mut socket_id: u64 = 0;
     for stream in listener.incoming() {
@@ -120,12 +143,12 @@ fn main() -> anyhow::Result<()>{
                 let repl_prop_tx = repl_prop_tx.clone();
 
                 println!("accepted new connection socket {}", _socket_id);
-                thread::spawn(move || {
-                    match handle_client(_stream, redis_map, server_opts, repl_prop_tx) {
+                thread::spawn(
+                    move || match handle_client(_stream, redis_map, server_opts, repl_prop_tx) {
                         Ok(_) => println!("connection {} handled correctly", _socket_id),
                         Err(err) => println!("{}", err),
-                    }
-                });
+                    },
+                );
                 socket_id += 1;
             }
             Err(e) => {
@@ -136,7 +159,11 @@ fn main() -> anyhow::Result<()>{
     Ok(())
 }
 
-fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<HashMap<String, Value>>>) -> anyhow::Result<()> {
+fn connect_master(
+    replica_info: ReplicaStatus,
+    port: u16,
+    redis_map: Arc<Mutex<HashMap<String, Value>>>,
+) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(format!("{}:{}", replica_info.master_address, replica_info.master_port))?;
     let mut buf_reader = BufReader::new(stream.try_clone()?);
 
@@ -150,13 +177,13 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     buf_reader.consume(consumed_bytes);
     println!("replica handshake received: {:?}", tokens);
     if !tokens.eq(&Resp::SimpleString("PONG".to_string())) {
-        return Err(anyhow!("wrong response from master"))
+        return Err(anyhow!("wrong response from master"));
     }
 
     let replconf = Resp::Array(vec![
         Resp::BulkString("REPLCONF".to_string()),
         Resp::BulkString("listening-port".to_string()),
-        Resp::BulkString(format!("{}", port))
+        Resp::BulkString(format!("{}", port)),
     ]);
     stream.write_all(replconf.encode_to_string().as_bytes())?;
     println!("replica sent first replconf message");
@@ -167,7 +194,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     buf_reader.consume(consumed_bytes);
     println!("replica handshake received: {:?}", tokens);
     if !tokens.eq(&Resp::SimpleString("OK".to_string())) {
-        return Err(anyhow!("wrong response from master"))
+        return Err(anyhow!("wrong response from master"));
     }
 
     let replconf = Resp::Array(vec![
@@ -184,7 +211,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     buf_reader.consume(consumed_bytes);
     println!("replica handshake received: {:?}", tokens);
     if !tokens.eq(&Resp::SimpleString("OK".to_string())) {
-        return Err(anyhow!("wrong response from master"))
+        return Err(anyhow!("wrong response from master"));
     }
 
     let psync = Resp::Array(vec![
@@ -211,7 +238,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     let rdb_bytes_len = String::from_utf8(rdb_len_line[1..].to_vec())?.parse::<usize>()?;
     buf_reader.consume(consumed_bytes);
     buf_reader.consume(rdb_bytes_len);
- 
+
     let mut ack_offset = 0i64;
     loop {
         let bytes = buf_reader.fill_buf()?;
@@ -225,7 +252,7 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
                 let command: RedisCommands = tokens.try_into()?;
                 handle_master_command(&command, &mut stream, &redis_map, ack_offset)?;
                 remainder
-            },
+            }
             Err(err) => {
                 println!("skip buffer since untokenizable: {}", err);
                 bytes
@@ -237,19 +264,30 @@ fn connect_master(replica_info: ReplicaStatus, port: u16, redis_map: Arc<Mutex<H
     }
 }
 
-fn handle_master_command(command: &RedisCommands, stream: &mut TcpStream, redis_map: &Arc<Mutex<HashMap<String, Value>>>, ack_offset: i64) -> anyhow::Result<()> {
+fn handle_master_command(
+    command: &RedisCommands,
+    stream: &mut TcpStream,
+    redis_map: &Arc<Mutex<HashMap<String, Value>>>,
+    ack_offset: i64,
+) -> anyhow::Result<()> {
     match command {
         RedisCommands::Ping => {
             println!("replica received ping from master");
         }
         RedisCommands::Set(opts) => {
-            redis_map.lock().unwrap()
-                .insert(opts.key.to_string(), Value { value: opts.value.to_string(), expire: opts.expire, timestamp: SystemTime::now() });
-        },
+            redis_map.lock().unwrap().insert(
+                opts.key.to_string(),
+                Value {
+                    value: opts.value.to_string(),
+                    expire: opts.expire,
+                    timestamp: SystemTime::now(),
+                },
+            );
+        }
         RedisCommands::ReplConf(commands::ReplConfMode::GetAck(_)) => {
             let response = RedisCommands::ReplConf(commands::ReplConfMode::Ack(ack_offset));
             stream.write_all(&Resp::from(response).encode_to_bytes())?;
-        },
+        }
         _ => {
             println!("replica ignore command from master: {:?}", command);
         }
@@ -264,14 +302,19 @@ fn handle_propagate_commands(repl_prop_rx: Receiver<RedisCommands>, replica_info
             let set_cmd: Resp = command.into();
             match TcpStream::connect(format!("{}:{}", replica_info.master_address, replica_info.master_port)) {
                 Ok(mut stream) => stream.write_all(&set_cmd.encode_to_bytes())?,
-                Err(err) => println!("handle propagation commands failed to connect to master: {}", err)
+                Err(err) => println!("handle propagation commands failed to connect to master: {}", err),
             }
             println!("set command {:?} propagated to master", set_cmd);
         }
     }
 }
 
-fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Value>>>, server_opts: Arc<Mutex<ServerStatus>>, repl_prop_tx: Sender<RedisCommands>) -> anyhow::Result<()> {
+fn handle_client(
+    mut stream: TcpStream,
+    redis_map: Arc<Mutex<HashMap<String, Value>>>,
+    server_opts: Arc<Mutex<ServerStatus>>,
+    repl_prop_tx: Sender<RedisCommands>,
+) -> anyhow::Result<()> {
     let mut buf_reader = BufReader::new(stream.try_clone()?);
     loop {
         let bytes = buf_reader.fill_buf()?;
@@ -292,7 +335,7 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
                     }
                 }
                 remainder
-            },
+            }
             Err(err) => {
                 println!("skip buffer since untokenizable: {}", err);
                 bytes
@@ -303,13 +346,25 @@ fn handle_client(mut stream: TcpStream, redis_map: Arc<Mutex<HashMap<String, Val
     }
 }
 
-fn handle_command(command: &RedisCommands, stream: &mut impl Write, redis_map: &Arc<Mutex<HashMap<String, Value>>>, server_info: &Arc<Mutex<ServerStatus>>, repl_prop_tx: &Sender<RedisCommands>) -> anyhow::Result<()> {
+fn handle_command(
+    command: &RedisCommands,
+    stream: &mut impl Write,
+    redis_map: &Arc<Mutex<HashMap<String, Value>>>,
+    server_info: &Arc<Mutex<ServerStatus>>,
+    repl_prop_tx: &Sender<RedisCommands>,
+) -> anyhow::Result<()> {
     let response = match command {
         RedisCommands::Echo(text) => Resp::SimpleString(text.to_string()),
         RedisCommands::Ping => Resp::SimpleString("PONG".to_string()),
         RedisCommands::Set(options) => {
-            redis_map.lock().unwrap()
-                .insert(options.key.to_string(), Value { value: options.value.to_string(), expire: options.expire, timestamp: SystemTime::now() });
+            redis_map.lock().unwrap().insert(
+                options.key.to_string(),
+                Value {
+                    value: options.value.to_string(),
+                    expire: options.expire,
+                    timestamp: SystemTime::now(),
+                },
+            );
             match server_info.lock().unwrap().server_type {
                 ServerType::Master(ref mut master_status) => {
                     let set_command = Resp::from(command.clone());
@@ -317,14 +372,18 @@ fn handle_command(command: &RedisCommands, stream: &mut impl Write, redis_map: &
                     for repl_stream in &mut master_status.repl_tcp_streams {
                         repl_stream.write_all(&set_command.encode_to_bytes())?;
                     }
-                },
-                ServerType::Replica(_) => { repl_prop_tx.send(command.clone())?; },
+                }
+                ServerType::Replica(_) => {
+                    repl_prop_tx.send(command.clone())?;
+                }
             };
 
             Resp::SimpleString("OK".to_string())
-        },
+        }
         RedisCommands::Get(key) => {
-            let value = redis_map.lock().unwrap()
+            let value = redis_map
+                .lock()
+                .unwrap()
                 .get(key)
                 .filter(|k| {
                     if let Some(expire) = k.expire {
@@ -335,38 +394,42 @@ fn handle_command(command: &RedisCommands, stream: &mut impl Write, redis_map: &
                     true
                 })
                 .map(|k| k.value.to_string());
-            if let Some(value) = value { Resp::BulkString(value) } else { Resp::NullBulkString }
-        },
-        RedisCommands::Info(info_section) => {
-            match info_section {
-                Some(InfoSection::Replication) => {
-                    let info = server_info.lock().unwrap().server_type.encode_to_info_string();
-                    Resp::BulkString(info)
-                },
-                None => {
-                    let info = server_info.lock().unwrap().server_type.encode_to_info_string();
-                    Resp::BulkString(info)
-                },
+            if let Some(value) = value {
+                Resp::BulkString(value)
+            } else {
+                Resp::NullBulkString
+            }
+        }
+        RedisCommands::Info(info_section) => match info_section {
+            Some(InfoSection::Replication) => {
+                let info = server_info.lock().unwrap().server_type.encode_to_info_string();
+                Resp::BulkString(info)
+            }
+            None => {
+                let info = server_info.lock().unwrap().server_type.encode_to_info_string();
+                Resp::BulkString(info)
             }
         },
-        RedisCommands::ReplConf(_) => {
-            Resp::SimpleString("OK".to_string())
-        },
-        RedisCommands::PSync(repl_id, repl_offset) => {
-            match (repl_id.as_ref(), repl_offset) {
-                ("?", -1) => {
-                    let (master_repl_id, master_repl_offset) = match &server_info.lock().unwrap().server_type {
-                        ServerType::Master(master_status) => (master_status.repl_id.clone(), master_status.repl_offset),
-                        ServerType::Replica(_) => unimplemented!(),
-                    };
-                    let response = Resp::SimpleString(format!("FULLRESYNC {} {}", master_repl_id, master_repl_offset));
-                    let empty_rdb_bytes = decode_hex(EMPTY_RDB)?;
-                    let empty_rdb_bytes = [b"$", empty_rdb_bytes.len().to_string().as_bytes(), b"\r\n", &empty_rdb_bytes].concat();
-                    stream.write_all(&[&response.encode_to_bytes(), empty_rdb_bytes.as_slice()].concat())?;
-                    Resp::Empty
-                },
-                _ => unimplemented!()
+        RedisCommands::ReplConf(_) => Resp::SimpleString("OK".to_string()),
+        RedisCommands::PSync(repl_id, repl_offset) => match (repl_id.as_ref(), repl_offset) {
+            ("?", -1) => {
+                let (master_repl_id, master_repl_offset) = match &server_info.lock().unwrap().server_type {
+                    ServerType::Master(master_status) => (master_status.repl_id.clone(), master_status.repl_offset),
+                    ServerType::Replica(_) => unimplemented!(),
+                };
+                let response = Resp::SimpleString(format!("FULLRESYNC {} {}", master_repl_id, master_repl_offset));
+                let empty_rdb_bytes = decode_hex(EMPTY_RDB)?;
+                let empty_rdb_bytes = [
+                    b"$",
+                    empty_rdb_bytes.len().to_string().as_bytes(),
+                    b"\r\n",
+                    &empty_rdb_bytes,
+                ]
+                .concat();
+                stream.write_all(&[&response.encode_to_bytes(), empty_rdb_bytes.as_slice()].concat())?;
+                Resp::Empty
             }
+            _ => unimplemented!(),
         },
         RedisCommands::Wait(num_replicas, timeout) => {
             let (mut replica_streams, master_offset) = match server_info.lock().unwrap().server_type {
@@ -376,37 +439,35 @@ fn handle_command(command: &RedisCommands, stream: &mut impl Write, redis_map: &
                         streams.push(stream.try_clone()?)
                     }
                     (streams, master_status.repl_offset)
-                },
+                }
                 ServerType::Replica(_) => (vec![], 0),
             };
             let (tx, rx) = channel::<i32>();
             let num_replicas = *num_replicas;
-            thread::spawn(move || {
-                loop {
-                    let mut replica_oks = 0;
-                    for stream in replica_streams.as_mut_slice() {
-                        let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
-                        if stream.write_all(&Resp::from(getack_command).encode_to_bytes()).is_ok() {
-                            let mut buf = [0u8, 128];
-                            let _ = stream.read(&mut buf);
-                            let (_, tokens) = tokenize_bytes(&buf).unwrap_or((&[0u8, 0], Resp::Empty));
-                            let command: RedisCommands = tokens.try_into().unwrap_or(RedisCommands::Ping);
-                            if let RedisCommands::ReplConf(commands::ReplConfMode::Ack(offset)) = command {
-                                if offset >= master_offset as i64 {
-                                    replica_oks += 1;
-                                }
+            thread::spawn(move || loop {
+                let mut replica_oks = 0;
+                for stream in replica_streams.as_mut_slice() {
+                    let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
+                    if stream.write_all(&Resp::from(getack_command).encode_to_bytes()).is_ok() {
+                        let mut buf = [0u8, 128];
+                        let _ = stream.read(&mut buf);
+                        let (_, tokens) = tokenize_bytes(&buf).unwrap_or((&[0u8, 0], Resp::Empty));
+                        let command: RedisCommands = tokens.try_into().unwrap_or(RedisCommands::Ping);
+                        if let RedisCommands::ReplConf(commands::ReplConfMode::Ack(offset)) = command {
+                            if offset >= master_offset as i64 {
+                                replica_oks += 1;
                             }
                         }
                     }
-                    if replica_oks >= num_replicas {
-                        let _ = tx.send(replica_oks);
-                    }
+                }
+                if replica_oks >= num_replicas {
+                    let _ = tx.send(replica_oks);
                 }
             });
 
             match rx.recv_timeout(Duration::from_millis(*timeout)) {
                 Ok(replica_oks) => Resp::Integer(replica_oks as i64),
-                Err(_) => Resp::Integer(0)
+                Err(_) => Resp::Integer(0),
             }
         }
     };
