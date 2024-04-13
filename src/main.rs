@@ -493,7 +493,6 @@ fn handle_command(
                 if Duration::from_millis(timeout_clone) < SystemTime::now().duration_since(start_time_clone).unwrap() || replica_oks >= num_replicas {
                     return;
                 }
-                thread::sleep(Duration::from_millis(10));
             });
 
             let mut last_replica_oks = 0;
