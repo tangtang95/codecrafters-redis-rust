@@ -233,8 +233,8 @@ fn connect_master(
         Resp::SimpleString(resync_text) if resync_text.starts_with("FULLRESYNC") => {
             let split_text: Vec<&str> = resync_text.split_ascii_whitespace().collect();
             split_text.get(2).unwrap_or(&"0").parse::<i64>()?
-        },
-        _ => return Err(anyhow!("wrong response from master"))
+        }
+        _ => return Err(anyhow!("wrong response from master")),
     };
     // Read RDB bytes
     let bytes = buf_reader.fill_buf()?;
@@ -448,75 +448,81 @@ fn handle_command(
                 }
                 ServerType::Replica(_) => (vec![], 0),
             };
-            println!("[wait]: master_offset: {}", master_data_offset);
-            let (tx, rx) = channel::<(bool, i32)>();
-            let num_replicas = *num_replicas;
-            let start_time_clone = start_time;
-            let timeout_clone = *timeout;
-            let server_info = server_info.clone();
-            thread::spawn(move || loop {
-                let mut replica_oks = 0;
-                for stream in replica_streams.as_mut_slice() {
-                    let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
-                    if stream.write_all(&Resp::from(getack_command).encode_to_bytes()).is_ok() {
-                        let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
-                        loop {
-                            let bytes = buf_reader.fill_buf().unwrap();
 
-                            if bytes.is_empty() {
-                                replica_oks += 1;
-                                break;
-                            }
-                            let remainder = match tokenize_bytes(bytes) {
-                                Ok((remainder, tokens)) => {
-                                    println!("received: {:?}", tokens);
-                                    let command: RedisCommands = tokens.try_into().unwrap();
-                                    if let RedisCommands::ReplConf(commands::ReplConfMode::Ack(offset)) = command {
-                                        if offset >= master_data_offset as i64 {
-                                            replica_oks += 1;
-                                            break;
+            if master_data_offset == 0 {
+                Resp::Integer(replica_streams.len() as i64)
+            } else {
+                println!("[wait]: master_offset: {}", master_data_offset);
+                let (tx, rx) = channel::<(bool, i32)>();
+                let num_replicas = *num_replicas;
+                let start_time_clone = start_time;
+                let timeout_clone = *timeout;
+                let server_info = server_info.clone();
+                thread::spawn(move || loop {
+                    let mut replica_oks = 0;
+                    for stream in replica_streams.as_mut_slice() {
+                        let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
+                        if stream.write_all(&Resp::from(getack_command).encode_to_bytes()).is_ok() {
+                            let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
+                            loop {
+                                let bytes = buf_reader.fill_buf().unwrap();
+
+                                let remainder = match tokenize_bytes(bytes) {
+                                    Ok((remainder, tokens)) => {
+                                        println!("received: {:?}", tokens);
+                                        let command: RedisCommands = tokens.try_into().unwrap();
+                                        if let RedisCommands::ReplConf(commands::ReplConfMode::Ack(offset)) = command {
+                                            if offset >= master_data_offset as i64 {
+                                                replica_oks += 1;
+                                                break;
+                                            }
                                         }
+                                        remainder
                                     }
-                                    remainder
-                                }
-                                Err(err) => {
-                                    println!("skip buffer since untokenizable: {}", err);
-                                    bytes
-                                }
-                            };
-                            let consumed_bytes = bytes.len() - remainder.len();
-                            buf_reader.consume(consumed_bytes);
+                                    Err(err) => {
+                                        println!("skip buffer since untokenizable: {}", err);
+                                        bytes
+                                    }
+                                };
+                                let consumed_bytes = bytes.len() - remainder.len();
+                                buf_reader.consume(consumed_bytes);
+                            }
                         }
                     }
-                }
-                if let ServerType::Master(master_status) = &mut server_info.lock().unwrap().server_type {
-                    let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
-                    let getack_resp = Resp::from(getack_command.clone());
-                    master_status.repl_offset += getack_resp.encode_to_bytes().len() as u64;
-                };
-                let _ = tx.send(( replica_oks >= num_replicas, replica_oks ));
-                if Duration::from_millis(timeout_clone) < SystemTime::now().duration_since(start_time_clone).unwrap() || replica_oks >= num_replicas {
-                    return;
-                }
-            });
-
-            let mut last_replica_oks = 0;
-            let replica_oks = loop {
-                if Duration::from_millis(*timeout) > SystemTime::now().duration_since(start_time)? {
-                    match rx.recv_timeout(Duration::from_millis(*timeout) - SystemTime::now().duration_since(start_time)?)  {
-                        Ok((done, replica_oks)) => {
-                            last_replica_oks = replica_oks;
-                            if done {
-                                break replica_oks;
-                            }
-                        },
-                        Err(_) => break last_replica_oks,
+                    if let ServerType::Master(master_status) = &mut server_info.lock().unwrap().server_type {
+                        let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
+                        let getack_resp = Resp::from(getack_command.clone());
+                        master_status.repl_offset += getack_resp.encode_to_bytes().len() as u64;
                     };
-                } else {
-                    break last_replica_oks;
-                }
-            };
-            Resp::Integer(replica_oks as i64)
+                    let _ = tx.send((replica_oks >= num_replicas, replica_oks));
+                    if Duration::from_millis(timeout_clone)
+                        < SystemTime::now().duration_since(start_time_clone).unwrap()
+                        || replica_oks >= num_replicas
+                    {
+                        return;
+                    }
+                });
+
+                let mut last_replica_oks = 0;
+                let replica_oks = loop {
+                    if Duration::from_millis(*timeout) > SystemTime::now().duration_since(start_time)? {
+                        match rx.recv_timeout(
+                            Duration::from_millis(*timeout) - SystemTime::now().duration_since(start_time)?,
+                        ) {
+                            Ok((done, replica_oks)) => {
+                                last_replica_oks = replica_oks;
+                                if done {
+                                    break replica_oks;
+                                }
+                            }
+                            Err(_) => break last_replica_oks,
+                        };
+                    } else {
+                        break last_replica_oks;
+                    }
+                };
+                Resp::Integer(replica_oks as i64)
+            }
         }
     };
     stream.write_all(response.encode_to_string().as_bytes())?;
