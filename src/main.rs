@@ -470,23 +470,22 @@ fn handle_command(
                 let num_replicas = *num_replicas;
 
                 let mut last_replica_oks = 0;
+                for stream in replica_streams.as_mut_slice() {
+                    let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
+                    stream.write_all(&Resp::from(getack_command).encode_to_bytes())?;
+                }
+                if let ServerType::Master(master_status) = &mut server_info.lock().unwrap().server_type {
+                    let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
+                    let getack_resp = Resp::from(getack_command.clone());
+                    master_status.repl_offset += getack_resp.encode_to_bytes().len() as u64;
+                };
                 let replica_oks = loop {
-                    for stream in replica_streams.as_mut_slice() {
-                        let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
-                        stream.write_all(&Resp::from(getack_command).encode_to_bytes())?;
-                    }
-                    if let ServerType::Master(master_status) = &mut server_info.lock().unwrap().server_type {
-                        let getack_command = RedisCommands::ReplConf(commands::ReplConfMode::GetAck("*".to_string()));
-                        let getack_resp = Resp::from(getack_command.clone());
-                        master_status.repl_offset += getack_resp.encode_to_bytes().len() as u64;
-                    };
-
                     let replica_oks = if let ServerType::Master(state) = &server_info.lock().unwrap().server_type {
                         state
                             .replicas_data
                             .iter()
                             .map(|replica_data| {
-                                if replica_data.latest_offset > master_data_offset {
+                                if replica_data.latest_offset >= master_data_offset {
                                     1
                                 } else {
                                     0
