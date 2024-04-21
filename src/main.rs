@@ -5,10 +5,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     num::ParseIntError,
-    sync::{
-        mpsc::{channel, Receiver, Sender},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime},
 };
@@ -115,7 +112,6 @@ fn main() -> anyhow::Result<()> {
         }),
     };
 
-    let (repl_prop_tx, repl_prop_rx) = channel::<RedisCommands>();
     if let ServerType::Replica(replica_status) = &server_type {
         let replica_info = ReplicaStatus {
             master_address: replica_status.master_address.clone(),
@@ -128,14 +124,6 @@ fn main() -> anyhow::Result<()> {
                 Err(err) => println!("{}", err),
             },
         );
-        let replica_info = ReplicaStatus {
-            master_address: replica_status.master_address.clone(),
-            master_port: replica_status.master_port,
-        };
-        thread::spawn(move || match handle_propagate_commands(repl_prop_rx, replica_info) {
-            Ok(_) => println!("exit from handle propagation commands correctly"),
-            Err(err) => println!("{}", err),
-        });
     }
 
     let server_opts = Arc::new(Mutex::new(ServerStatus { server_type }));
@@ -147,15 +135,12 @@ fn main() -> anyhow::Result<()> {
                 let _socket_id = socket_id;
                 let redis_map = redis_map.clone();
                 let server_opts = server_opts.clone();
-                let repl_prop_tx = repl_prop_tx.clone();
 
                 println!("accepted new connection socket {}", _socket_id);
-                thread::spawn(
-                    move || match handle_client(_stream, redis_map, server_opts, repl_prop_tx) {
-                        Ok(_) => println!("connection {} handled correctly", _socket_id),
-                        Err(err) => println!("{}", err),
-                    },
-                );
+                thread::spawn(move || match handle_client(_stream, redis_map, server_opts) {
+                    Ok(_) => println!("connection {} handled correctly", _socket_id),
+                    Err(err) => println!("{}", err),
+                });
                 socket_id += 1;
             }
             Err(e) => {
@@ -304,25 +289,10 @@ fn handle_master_command(
     Ok(())
 }
 
-fn handle_propagate_commands(repl_prop_rx: Receiver<RedisCommands>, replica_info: ReplicaStatus) -> anyhow::Result<()> {
-    loop {
-        let command = repl_prop_rx.recv()?;
-        if let RedisCommands::Set(_) = command {
-            let set_cmd: Resp = command.into();
-            match TcpStream::connect(format!("{}:{}", replica_info.master_address, replica_info.master_port)) {
-                Ok(mut stream) => stream.write_all(&set_cmd.encode_to_bytes())?,
-                Err(err) => println!("handle propagation commands failed to connect to master: {}", err),
-            }
-            println!("set command {:?} propagated to master", set_cmd);
-        }
-    }
-}
-
 fn handle_client(
     mut stream: TcpStream,
     redis_map: Arc<Mutex<HashMap<String, Value>>>,
     server_opts: Arc<Mutex<ServerStatus>>,
-    repl_prop_tx: Sender<RedisCommands>,
 ) -> anyhow::Result<()> {
     let mut buf_reader = BufReader::new(stream.try_clone()?);
     loop {
@@ -335,7 +305,7 @@ fn handle_client(
             Ok((remainder, tokens)) => {
                 println!("received: {:?}", tokens);
                 let command: RedisCommands = tokens.try_into()?;
-                handle_command(&command, &mut stream, &redis_map, &server_opts, &repl_prop_tx)?;
+                handle_command(&command, &mut stream, &redis_map, &server_opts)?;
                 if let RedisCommands::PSync(_, _) = command {
                     if let ServerType::Master(ref mut master_status) = server_opts.lock().unwrap().server_type {
                         let stream_clone = stream.try_clone()?;
@@ -369,7 +339,6 @@ fn handle_command(
     stream: &mut impl Write,
     redis_map: &Arc<Mutex<HashMap<String, Value>>>,
     server_info: &Arc<Mutex<ServerStatus>>,
-    repl_prop_tx: &Sender<RedisCommands>,
 ) -> anyhow::Result<()> {
     let response = match command {
         RedisCommands::Echo(text) => Resp::SimpleString(text.to_string()),
@@ -393,7 +362,7 @@ fn handle_command(
                     }
                 }
                 ServerType::Replica(_) => {
-                    repl_prop_tx.send(command.clone())?;
+                    unimplemented!()
                 }
             };
 
@@ -484,13 +453,7 @@ fn handle_command(
                         state
                             .replicas_data
                             .iter()
-                            .map(|replica_data| {
-                                if replica_data.latest_offset >= master_data_offset {
-                                    1
-                                } else {
-                                    0
-                                }
-                            })
+                            .map(|replica_data| (replica_data.latest_offset >= master_data_offset) as i32)
                             .sum()
                     } else {
                         0
