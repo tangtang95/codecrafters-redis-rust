@@ -7,7 +7,7 @@ use std::{
     num::ParseIntError,
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime}, path::PathBuf, str::FromStr,
 };
 
 use crate::{
@@ -29,6 +29,8 @@ struct Value {
 struct ServerOptions {
     port: u16,
     replicaof: Option<(String, u16)>,
+    dir: Option<PathBuf>,
+    db_filename: Option<String>,
 }
 
 struct ServerStatus {
@@ -45,6 +47,8 @@ struct MasterStatus {
     repl_offset: u64,
     repl_data_offset: u64,
     replicas_data: Vec<ReplicaData>,
+    dir: Option<PathBuf>,
+    db_filename: Option<String>
 }
 
 struct ReplicaData {
@@ -76,6 +80,8 @@ fn main() -> anyhow::Result<()> {
     let mut server_opts = ServerOptions {
         port: 6379,
         replicaof: None,
+        dir: None,
+        db_filename: None
     };
     let _ = args.next();
     while let Some(arg) = args.next() {
@@ -91,6 +97,12 @@ fn main() -> anyhow::Result<()> {
                 .parse::<u16>()
                 .with_context(|| "master port is not a number between 0 and 65536")?;
             server_opts.replicaof = Some((master_host, master_port));
+        } else if arg.eq("--dir") {
+            let dir = args.next().ok_or(anyhow!("dir path arg not found"))?;
+            server_opts.dir = Some(PathBuf::from_str(&dir)?);
+        } else if arg.eq("--dbfilename") {
+            let db_filename = args.next().ok_or(anyhow!("dbfilename arg not found"))?;
+            server_opts.db_filename = Some(db_filename);
         } else {
             return Err(anyhow!("invalid cli arg \"{arg}\""));
         }
@@ -109,6 +121,8 @@ fn main() -> anyhow::Result<()> {
             repl_offset: 0,
             repl_data_offset: 0,
             replicas_data: Vec::new(),
+            dir: server_opts.dir,
+            db_filename: server_opts.db_filename
         }),
     };
 
@@ -467,6 +481,35 @@ fn handle_command(
                     last_replica_oks = replica_oks;
                 };
                 Resp::Integer(replica_oks as i64)
+            }
+        },
+        RedisCommands::Config(mode, config_key) => {
+            if mode.eq_ignore_ascii_case("GET") {
+                match config_key.as_str() {
+                    "dir" => match &server_info.lock().unwrap().server_type {
+                        ServerType::Master(state) => {
+                            let dir = state.dir.as_ref().map(|dir| dir.to_str().unwrap_or("")).unwrap_or("");
+                            Resp::Array(vec![
+                                Resp::BulkString("dir".to_owned()),
+                                Resp::BulkString(dir.to_owned())
+                            ])
+                        },
+                        ServerType::Replica(_) => unimplemented!()
+                    },
+                    "dbfilename" => match &server_info.lock().unwrap().server_type {
+                        ServerType::Master(state) => {
+                            let db_filename = state.db_filename.as_deref().unwrap_or("");
+                            Resp::Array(vec![
+                                Resp::BulkString(config_key.to_owned()),
+                                Resp::BulkString(db_filename.to_owned())
+                            ])
+                        },
+                        ServerType::Replica(_) => unimplemented!()
+                    },
+                    _ => unimplemented!()
+                }
+            } else {
+                unimplemented!()
             }
         }
     };

@@ -12,6 +12,7 @@ pub enum RedisCommands {
     ReplConf(ReplConfMode),
     PSync(String, i64),
     Wait(i32, u64),
+    Config(String, String)
 }
 
 #[derive(Debug, Clone)]
@@ -163,7 +164,16 @@ impl TryFrom<Resp> for RedisCommands {
                 let num_replicas = num_replicas.parse::<i32>()?;
                 let timeout = timeout.parse::<u64>()?;
                 Ok(RedisCommands::Wait(num_replicas, timeout))
-            }
+            },
+            "config" => {
+                let Some(Resp::BulkString(mode)) = array.get(1) else {
+                    return Err(anyhow!("Config mode missing"));
+                };
+                let Some(Resp::BulkString(config_key)) = array.get(2) else {
+                    return Err(anyhow!("Config key missing"));
+                };
+                Ok(RedisCommands::Config(mode.to_owned(), config_key.to_owned()))
+            },
             _ => unimplemented!(),
         }
     }
@@ -212,6 +222,11 @@ impl From<RedisCommands> for Resp {
                 Resp::BulkString(num_replicas.to_string()),
                 Resp::BulkString(timeout.to_string()),
             ]),
+            RedisCommands::Config(mode, key) => Resp::Array(vec![
+                Resp::BulkString("CONFIG".to_string()),
+                Resp::BulkString(mode.to_string()),
+                Resp::BulkString(key.to_string()),
+            ])
         }
     }
 }
